@@ -8,21 +8,41 @@
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# WITHTHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Final stage - Alpine Linux
+FROM alpine/helm:3.14.4 as helm
+
+# Build stage - builds the binary for the target platform
+FROM golang:1.25-alpine as builder
+
+# Install build dependencies
+RUN apk add --no-cache \
+    git \
+    make \
+    gcc \
+    musl-dev \
+    bash
+
+# Copy source code
+WORKDIR /src
+COPY . .
+
+# Build the binary for the target platform
+RUN make build
+
+# Final stage - creates the minimal image
 FROM alpine:3.19
 
-# Install dependencies
+# Install runtime dependencies
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
     && update-ca-certificates
 
-# Copy the binary for the current platform
-COPY build/external-dns /usr/local/bin/external-dns
+# Copy the binary from the builder stage
+COPY --from=builder /src/build/external-dns /usr/local/bin/external-dns
 
 # Set the entrypoint
 ENTRYPOINT ["/usr/local/bin/external-dns"]
