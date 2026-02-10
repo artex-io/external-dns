@@ -89,6 +89,7 @@ REGISTRY      ?= us.gcr.io/k8s-artifacts-prod/external-dns
 IMAGE         ?= $(REGISTRY)/$(BINARY)
 VERSION       ?= $(shell git describe --tags --always --dirty --match "v*")
 GIT_COMMIT    ?= $(shell git rev-parse --short HEAD)
+IMAGE_TAG     ?= $(VERSION)
 BUILD_FLAGS   ?= -v
 LDFLAGS       ?= -X sigs.k8s.io/external-dns/pkg/apis/externaldns.Version=$(VERSION) -w -s
 LDFLAGS       += -X sigs.k8s.io/external-dns/pkg/apis/externaldns.GitCommit=$(GIT_COMMIT)
@@ -131,7 +132,7 @@ build-multi-arch-image:
 		-f buildx.Dockerfile .
 
 push-multi-arch-image:
-	docker buildx build $(DOCKER_BUILD_LABELS) -t $(IMAGE) \
+	docker buildx build $(DOCKER_BUILD_LABELS) -t $(IMAGE):$(IMAGE_TAG) \
 		--cache-to=type=local,dest=$(DOCKER_BUILD_CACHE) \
 		--cache-from=type=local,src=$(DOCKER_BUILD_CACHE) \
 		--platform=$(IMG_PLATFORM) \
