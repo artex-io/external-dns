@@ -97,6 +97,14 @@ SHELL          = /bin/bash
 IMG_PLATFORM  ?= linux/amd64,linux/arm64,linux/arm/v7
 IMG_PUSH      ?= true
 IMG_SBOM      ?= none
+DOCKER_BUILD_CACHE     ?= /tmp/.buildx-cache
+DOCKER_BUILD_LABELS  = --label org.opencontainers.image.title=ExternalDNS
+DOCKER_BUILD_LABELS += --label org.opencontainers.image.description="ExternalDNS synchronizes exposed Kubernetes Services and Ingresses with DNS providers"
+DOCKER_BUILD_LABELS += --label org.opencontainers.image.url="https://github.com/kubernetes-sigs/external-dns"
+DOCKER_BUILD_LABELS += --label org.opencontainers.image.source="https://github.com/kubernetes-sigs/external-dns"
+DOCKER_BUILD_LABELS += --label org.opencontainers.image.revision=$(shell git rev-parse HEAD)
+DOCKER_BUILD_LABELS += --label org.opencontainers.image.version=$(shell git describe --tags --always)
+DOCKER_BUILD_LABELS += --label org.opencontainers.image.created=$(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
 
 build: build/$(BINARY)
 
@@ -113,6 +121,22 @@ build.push/multiarch: ko
 
 build.image/multiarch:
 	$(MAKE) IMG_PUSH=false build.push/multiarch
+
+## Build Multi archs Docker image
+build-multi-arch-image:
+	docker buildx build $(DOCKER_BUILD_LABELS) -t $(IMAGE) \
+		--cache-to=type=local,dest=$(DOCKER_BUILD_CACHE) \
+		--cache-from=type=local,src=$(DOCKER_BUILD_CACHE) \
+		--platform=$(IMG_PLATFORM) \
+		-f buildx.Dockerfile .
+
+push-multi-arch-image:
+	docker buildx build $(DOCKER_BUILD_LABELS) -t $(IMAGE) \
+		--cache-to=type=local,dest=$(DOCKER_BUILD_CACHE) \
+		--cache-from=type=local,src=$(DOCKER_BUILD_CACHE) \
+		--platform=$(IMG_PLATFORM) \
+		-f buildx.Dockerfile . \
+		--push
 
 build.image:
 	$(MAKE) IMG_PLATFORM=linux/$(ARCH) build.image/multiarch
