@@ -30,6 +30,7 @@ jobs:
 
       - run: |
           pip install -r docs/scripts/requirements.txt
+          pip install mdx_truly_sane_lists
 
       - name: Configure Git user
         run: |

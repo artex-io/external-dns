@@ -53,5 +53,7 @@ jobs:
 
     - name: Build and push docker image
       run: |
+        export REGISTRY=ghcr.io
+        export IMAGE=$REGISTRY/kubernetes-sigs/external-dns
         make push-multi-arch-image
       timeout-minutes: 20
