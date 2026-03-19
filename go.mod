@@ -25,7 +25,6 @@ require (
 	github.com/bodgit/tsig v1.2.2
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/civo/civogo v0.6.5
-	github.com/cloudflare/cloudflare-go v0.116.0
 	github.com/cloudflare/cloudflare-go/v5 v5.1.0
 	github.com/datawire/ambassador v1.12.4
 	github.com/denverdino/aliyungo v0.0.0-20230411124812-ab98a9173ace
@@ -111,7 +110,6 @@ require (
 	github.com/go-openapi/jsonreference v0.21.0 // indirect
 	github.com/go-openapi/swag v0.23.1 // indirect
 	github.com/go-resty/resty/v2 v2.17.0 // indirect
-	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/gofrs/flock v0.10.0 // indirect
 	github.com/gofrs/uuid v4.4.0+incompatible // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
@@ -172,9 +170,9 @@ require (
 	go.etcd.io/etcd/client/pkg/v3 v3.6.6 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
-	go.opentelemetry.io/otel v1.38.0 // indirect
-	go.opentelemetry.io/otel/metric v1.38.0 // indirect
-	go.opentelemetry.io/otel/trace v1.38.0 // indirect
+	go.opentelemetry.io/otel v1.39.0 // indirect
+	go.opentelemetry.io/otel/metric v1.39.0 // indirect
+	go.opentelemetry.io/otel/trace v1.39.0 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
@@ -185,9 +183,9 @@ require (
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/term v0.38.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20251022142026-3a174f9686a8 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251124214823-79d6a2a48846 // indirect
-	google.golang.org/grpc v1.77.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20251202230838-ff82c1b0f217 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
+	google.golang.org/grpc v1.79.3 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
