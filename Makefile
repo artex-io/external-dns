@@ -105,6 +105,7 @@ IMG_PLATFORM  ?= linux/amd64,linux/arm64,linux/arm/v7
 IMG_PUSH      ?= true
 IMG_SBOM      ?= none
 DOCKER_BUILD_CACHE     ?= /tmp/.buildx-cache
+DOCKER_BUILDX_ARGS     ?=
 DOCKER_BUILD_LABELS  = --label org.opencontainers.image.title=ExternalDNS
 DOCKER_BUILD_LABELS += --label org.opencontainers.image.description="ExternalDNS synchronizes exposed Kubernetes Services and Ingresses with DNS providers"
 DOCKER_BUILD_LABELS += --label org.opencontainers.image.url="https://github.com/kubernetes-sigs/external-dns"
@@ -135,14 +136,14 @@ build-multi-arch-image:
 		--cache-to=type=local,dest=$(DOCKER_BUILD_CACHE) \
 		--cache-from=type=local,src=$(DOCKER_BUILD_CACHE) \
 		--platform=$(IMG_PLATFORM) \
-		-f buildx.Dockerfile .
+		-f buildx.Dockerfile $(DOCKER_BUILDX_ARGS) .
 
 push-multi-arch-image:
 	docker buildx build $(DOCKER_BUILD_LABELS) -t $(IMAGE) \
 		--cache-to=type=local,dest=$(DOCKER_BUILD_CACHE) \
 		--cache-from=type=local,src=$(DOCKER_BUILD_CACHE) \
 		--platform=$(IMG_PLATFORM) \
-		-f buildx.Dockerfile . \
+		-f buildx.Dockerfile $(DOCKER_BUILDX_ARGS) . \
 		--push
 
 build.image:
