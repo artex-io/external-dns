@@ -21,17 +21,22 @@ import (
 	"time"
 
 	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/internal/sets"
 	"sigs.k8s.io/external-dns/source"
 )
 
 type Config struct {
 	defaultTargets      []string
 	forceDefaultTargets bool
+	provider            string
 	nat64Networks       []string
 	targetNetFilter     []string
 	excludeTargetNets   []string
 	minTTL              time.Duration
-	sourceWrappers      map[string]bool // map of source wrappers, e.g. "targetfilter", "nat64"
+	preferAlias         bool
+	ptrSupported        bool             // PTR is in --managed-record-types
+	createPTR           bool             // --create-ptr default for all A/AAAA records
+	sourceWrappers      sets.Set[string] // set of source wrappers, e.g. "targetfilter", "nat64"
 }
 
 func NewConfig(opts ...Option) *Config {
@@ -80,28 +85,60 @@ func WithMinTTL(ttl time.Duration) Option {
 	}
 }
 
+// WithProvider sets the DNS provider name, used to filter provider-specific
+// endpoint properties to only those belonging to the configured provider.
+func WithProvider(input string) Option {
+	return func(o *Config) {
+		o.provider = input
+	}
+}
+
+func WithPreferAlias(enabled bool) Option {
+	return func(o *Config) {
+		o.preferAlias = enabled
+	}
+}
+
+// WithPTRSupported indicates whether PTR is included in --managed-record-types.
+// When false the PTR source wrapper is not installed at all, so no reverse
+// records are generated regardless of the --create-ptr flag.
+func WithPTRSupported(supported bool) Option {
+	return func(o *Config) {
+		o.ptrSupported = supported
+	}
+}
+
+// WithCreatePTR sets the global default for automatic PTR record creation
+// (the --create-ptr flag). When true, every A/AAAA endpoint gets a PTR record
+// unless the resource opts out via annotation. When false, only resources that
+// explicitly request PTR via annotation produce reverse records.
+func WithCreatePTR(enabled bool) Option {
+	return func(o *Config) {
+		o.createPTR = enabled
+	}
+}
+
 // addSourceWrapper registers a source wrapper by name in the Config.
 // It initializes the sourceWrappers map if it is nil.
 func (o *Config) addSourceWrapper(name string) {
 	if o.sourceWrappers == nil {
-		o.sourceWrappers = make(map[string]bool)
+		o.sourceWrappers = sets.New[string]()
 	}
-	o.sourceWrappers[name] = true
+	o.sourceWrappers.Insert(name)
 }
 
 // isSourceWrapperInstrumented returns whether a source wrapper is enabled or not.
 func (o *Config) isSourceWrapperInstrumented(name string) bool {
-	if o.sourceWrappers == nil {
+	if len(o.sourceWrappers) == 0 {
 		return false
 	}
-	_, ok := o.sourceWrappers[name]
-	return ok
+	return o.sourceWrappers.Has(name)
 }
 
-// WrapSources combines multiple sources into a single source,
+// wrapSources combines multiple sources into a single source,
 // applies optional NAT64 and target network filtering wrappers, and sets a minimum TTL.
 // It registers each applied wrapper in the Config for instrumentation.
-func WrapSources(
+func wrapSources(
 	sources []source.Source,
 	opts *Config,
 ) (source.Source, error) {
@@ -120,7 +157,12 @@ func WrapSources(
 		combinedSource = NewTargetFilterSource(combinedSource, targetFilter)
 		opts.addSourceWrapper("target-filter")
 	}
-	combinedSource = NewPostProcessor(combinedSource, WithTTL(opts.minTTL))
+	if opts.ptrSupported {
+		combinedSource = NewPTRSource(combinedSource, opts.createPTR)
+		opts.addSourceWrapper("ptr")
+	}
+	combinedSource = NewPostProcessor(combinedSource, WithTTL(opts.minTTL), WithPostProcessorPreferAlias(opts.preferAlias),
+		WithPostProcessorProvider(opts.provider))
 	opts.addSourceWrapper("post-processor")
 	return combinedSource, nil
 }

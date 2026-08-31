@@ -21,16 +21,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+
 	"sigs.k8s.io/external-dns/endpoint"
-	"sigs.k8s.io/external-dns/internal/testutils"
+	logtest "sigs.k8s.io/external-dns/internal/testutils/log"
 )
 
-// helper implementing metav1.ObjectMetaAccessor for tests
+// helper implementing metav1.Object for tests via embedded ObjectMeta
 type objectUnderTest struct {
-	meta metav1.ObjectMeta
+	metav1.ObjectMeta
 }
-
-func (t *objectUnderTest) GetObjectMeta() metav1.Object { return &t.meta }
 
 func TestParseAnnotationFilter(t *testing.T) {
 	tests := []struct {
@@ -377,7 +376,7 @@ func TestIsControllerMismatch(t *testing.T) {
 		{
 			name: "no controller annotation",
 			entity: objectUnderTest{
-				meta: metav1.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:        "my-service",
 					Namespace:   "default",
 					Annotations: map[string]string{},
@@ -389,7 +388,7 @@ func TestIsControllerMismatch(t *testing.T) {
 		{
 			name: "non-matching controller annotation",
 			entity: objectUnderTest{
-				meta: metav1.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:      "my-service",
 					Namespace: "default",
 					Annotations: map[string]string{
@@ -404,7 +403,7 @@ func TestIsControllerMismatch(t *testing.T) {
 		{
 			name: "empty controller value with annotation",
 			entity: objectUnderTest{
-				meta: metav1.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-ingress",
 					Namespace: "kube-system",
 					Annotations: map[string]string{
@@ -419,7 +418,7 @@ func TestIsControllerMismatch(t *testing.T) {
 		{
 			name: "nil annotations",
 			entity: objectUnderTest{
-				meta: metav1.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:        "service",
 					Namespace:   "default",
 					Annotations: nil,
@@ -432,15 +431,17 @@ func TestIsControllerMismatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			hook := testutils.LogsUnderTestWithLogLevel(log.DebugLevel, t)
+			hook := logtest.LogsUnderTestWithLogLevel(log.DebugLevel, t)
 
 			result := IsControllerMismatch(&tt.entity, tt.resourceType)
 			assert.Equal(t, tt.expected, result)
+			match := IsControllerMatch[*objectUnderTest](&tt.entity)
+			assert.Equal(t, !tt.expected, match)
 
 			if tt.debugMsg != "" {
-				testutils.TestHelperLogContains(tt.debugMsg, hook, t)
+				logtest.TestHelperLogContains(tt.debugMsg, hook, t)
 			} else {
-				testutils.TestHelperLogNotContains("Skipping", hook, t)
+				logtest.TestHelperLogNotContains("Skipping", hook, t)
 			}
 		})
 	}

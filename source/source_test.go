@@ -23,35 +23,19 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 )
 
-func TestGetLabelSelector(t *testing.T) {
-	tests := []struct {
-		name             string
-		annotationFilter string
-		expectError      bool
-		expectedSelector string
+func TestEventHandlerFunc(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		call func(eventHandlerFunc)
 	}{
-		{
-			name:             "Valid label selector",
-			annotationFilter: "key1=value1,key2=value2",
-			expectedSelector: "key1=value1,key2=value2",
-		},
-		{
-			name:             "Invalid label selector",
-			annotationFilter: "key1==value1",
-			expectedSelector: "key1=value1",
-		},
-		{
-			name:             "Empty label selector",
-			annotationFilter: "",
-			expectedSelector: "",
-		},
-	}
-
-	for _, tt := range tests {
+		{"OnAdd", func(fn eventHandlerFunc) { fn.OnAdd(nil, false) }},
+		{"OnUpdate", func(fn eventHandlerFunc) { fn.OnUpdate(nil, nil) }},
+		{"OnDelete", func(fn eventHandlerFunc) { fn.OnDelete(nil) }},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			selector, err := getLabelSelector(tt.annotationFilter)
-			assert.NoError(t, err)
-			assert.Equal(t, tt.expectedSelector, selector.String())
+			called := false
+			tt.call(func() { called = true })
+			assert.True(t, called)
 		})
 	}
 }

@@ -47,7 +47,7 @@ func TTLFromAnnotations(annotations map[string]string, resource string) endpoint
 		return ttlNotConfigured
 	}
 	if ttlValue < ttlMinimum || ttlValue > ttlMaximum {
-		log.Warnf("TTL value %q must be between [%d, %d]", ttlValue, ttlMinimum, ttlMaximum)
+		log.Warnf("TTL value %d must be between [%d, %d]", ttlValue, ttlMinimum, ttlMaximum)
 		return ttlNotConfigured
 	}
 	return endpoint.TTL(ttlValue)
@@ -57,15 +57,20 @@ func TTLFromAnnotations(annotations map[string]string, resource string) endpoint
 // the controller annotation is present and does not match the expected controller value.
 // It also logs the reason.
 func IsControllerMismatch(
-	entity metav1.ObjectMetaAccessor,
+	entity metav1.Object,
 	rType string,
 ) bool {
-	value, ok := entity.GetObjectMeta().GetAnnotations()[ControllerKey]
+	value, ok := entity.GetAnnotations()[ControllerKey]
 	if ok && value != ControllerValue {
-		log.Debugf(skipCtrlMsg, rType, entity.GetObjectMeta().GetNamespace(), entity.GetObjectMeta().GetName(), ControllerKey, value, ControllerValue)
+		log.Debugf(skipCtrlMsg, rType, entity.GetNamespace(), entity.GetName(), ControllerKey, value, ControllerValue)
 		return true
 	}
 	return false
+}
+
+// IsControllerMatch returns true when the resource should not be skipped
+func IsControllerMatch[T metav1.Object](entity T) bool {
+	return !IsControllerMismatch(entity, "")
 }
 
 // parseTTL parses TTL from string, returning duration in seconds.

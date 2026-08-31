@@ -23,13 +23,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cloudflare/cloudflare-go/v5"
-	"github.com/cloudflare/cloudflare-go/v5/custom_hostnames"
-	"github.com/cloudflare/cloudflare-go/v5/dns"
+	"github.com/cloudflare/cloudflare-go/v7"
+	"github.com/cloudflare/cloudflare-go/v7/custom_hostnames"
+	"github.com/cloudflare/cloudflare-go/v7/dns"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+
 	"sigs.k8s.io/external-dns/endpoint"
-	"sigs.k8s.io/external-dns/internal/testutils"
+	logtest "sigs.k8s.io/external-dns/internal/testutils/log"
 	"sigs.k8s.io/external-dns/plan"
 )
 
@@ -180,7 +181,7 @@ func TestCloudflareDisabledCustomHostnameOperations(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "a.foo.fancybar.com",
 						},
 					},
@@ -200,7 +201,7 @@ func TestCloudflareDisabledCustomHostnameOperations(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "c1.foo.fancybar.com",
 						},
 					},
@@ -226,7 +227,7 @@ func TestCloudflareDisabledCustomHostnameOperations(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "b.foo.fancybar.com",
 						},
 					},
@@ -239,7 +240,7 @@ func TestCloudflareDisabledCustomHostnameOperations(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "c2.foo.fancybar.com",
 						},
 					},
@@ -305,7 +306,7 @@ func TestCloudflareCustomHostnameNotFoundOnRecordDeletion(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "newerror-getCustomHostnameOrigin.foo.fancybar.com",
 						},
 					},
@@ -337,7 +338,7 @@ func TestCloudflareCustomHostnameNotFoundOnRecordDeletion(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "a.foo.fancybar.com",
 						},
 					},
@@ -350,7 +351,7 @@ func TestCloudflareCustomHostnameNotFoundOnRecordDeletion(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
-			hook := testutils.LogsUnderTestWithLogLevel(log.InfoLevel, t)
+			hook := logtest.LogsUnderTestWithLogLevel(log.InfoLevel, t)
 
 			records, err := provider.Records(ctx)
 			if err != nil {
@@ -402,7 +403,7 @@ func TestCloudflareCustomHostnameNotFoundOnRecordDeletion(t *testing.T) {
 				t.Error(e)
 			}
 
-			testutils.TestHelperLogContains(tc.logOutput, hook, t)
+			logtest.TestHelperLogContains(tc.logOutput, hook, t)
 		})
 	}
 }
@@ -428,7 +429,7 @@ func TestCloudflareListCustomHostnamesWithPagionation(t *testing.T) {
 				Labels:     endpoint.Labels{},
 				ProviderSpecific: endpoint.ProviderSpecific{
 					{
-						Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+						Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 						Value: fmt.Sprintf("host-%d.foo.fancybar.com", i),
 					},
 				},

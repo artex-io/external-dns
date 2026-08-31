@@ -1,4 +1,6 @@
 suite: RBAC configuration
+set:
+  policy: upsert-only
 templates:
   - clusterrole.yaml
   - clusterrolebinding.yaml
@@ -124,7 +126,7 @@ tests:
               verbs: ["get","watch","list"]
             - apiGroups: ["externaldns.k8s.io"]
               resources: ["dnsendpoints/status"]
-              verbs: ["*"]
+              verbs: ["update"]
             - apiGroups: ["traefik.containo.us", "traefik.io"]
               resources: ["ingressroutes", "ingressroutetcps", "ingressrouteudps"]
               verbs: ["get","watch","list"]
@@ -229,19 +231,53 @@ tests:
           value: rbac-external-dns-viewer
         template: clusterrolebinding.yaml
 
-  - it: should create all required resources when namespaced=true and gatewayNamespace is specified
+  - it: should create Role in other namespace when sourceNamespace is set and namespaced is true
+    set:
+      namespaced: true
+      sources:
+        - service
+      sourceNamespace: secondary
+    asserts:
+      - isKind:
+          of: Role
+        template: clusterrole.yaml
+      - equal:
+          path: metadata.name
+          value: rbac-external-dns
+        template: clusterrole.yaml
+      - equal:
+          path: metadata.namespace
+          value: secondary
+        template: clusterrole.yaml
+
+  - it: should create RoleBinding in other namespace when sourceNamespace is set and namespaced is true
+    set:
+      namespaced: true
+      sources:
+        - service
+      sourceNamespace: secondary
+    asserts:
+      - isKind:
+          of: RoleBinding
+        template: clusterrolebinding.yaml
+      - equal:
+          path: metadata.namespace
+          value: secondary
+        template: clusterrolebinding.yaml
+
+  - it: should create only namespaced RBAC when namespaced=true and gatewayNamespace is specified
     set:
       namespaced: true
       gatewayNamespace: gateway-ns
       sources:
         - gateway-httproute
     asserts:
-      # Should have: main Role + ClusterRole for namespaces + Gateway Role
+      # Should have: main Role + Gateway Role only (no cluster-scoped RBAC)
       - hasDocuments:
-          count: 3
+          count: 2
         template: clusterrole.yaml
       - hasDocuments:
-          count: 3
+          count: 2
         template: clusterrolebinding.yaml
 
       # Main role should exist and contain route permissions but NOT gateway permissions
@@ -272,12 +308,18 @@ tests:
           value: rbac-external-dns
         template: clusterrole.yaml
 
-      # ClusterRole for namespaces should exist
+      # Both documents should be Roles (no ClusterRole present)
       - isKind:
-          of: ClusterRole
+          of: Role
         documentSelector:
           path: metadata.name
-          value: rbac-external-dns-namespaces
+          value: rbac-external-dns
+        template: clusterrole.yaml
+      - isKind:
+          of: Role
+        documentSelector:
+          path: metadata.name
+          value: rbac-external-dns-gateway
         template: clusterrole.yaml
 
       # Gateway role should exist and have gateway permissions only
@@ -544,3 +586,50 @@ tests:
             - apiGroups: ["gloo.solo.io","gateway.solo.io"]
               resources: ["proxies","virtualservices","gateways"]
               verbs: ["get","watch","list"]
+
+  - it: should include 'listenersets' in clusterwide RBAC rules for 'gateway-api' with a Gateway source being present and 'enableGatewayListenerSets' being set
+    set:
+      enableGatewayListenerSets: true
+      namespaced: false
+      sources:
+        - gateway-httproute
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["gateway.networking.k8s.io"]
+            resources: ["listenersets"]
+            verbs: ["get","watch","list"]
+        template: clusterrole.yaml
+
+  - it: should include 'listenersets' in namespaced RBAC rules for 'gateway-api' with a Gateway source being present and 'enableGatewayListenerSets' being set
+    set:
+      enableGatewayListenerSets: true
+      namespaced: true
+      gatewayNamespace: gateway-ns
+      sources:
+        - gateway-httproute
+    asserts:
+      # Gateway clusterrole should not have listenersets permissions
+      - notContains:
+          path: rules
+          content:
+            apiGroups: ["gateway.networking.k8s.io"]
+            resources: ["listenersets"]
+            verbs: ["get","watch","list"]
+        documentSelector:
+          path: metadata.name
+          value: rbac-external-dns
+        template: clusterrole.yaml
+
+      # Gateway role should exist and have listenersets permissions
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["gateway.networking.k8s.io"]
+            resources: ["listenersets"]
+            verbs: ["get","watch","list"]
+        documentSelector:
+          path: metadata.name
+          value: rbac-external-dns-gateway
+        template: clusterrole.yaml

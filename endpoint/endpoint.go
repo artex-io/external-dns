@@ -17,15 +17,19 @@ limitations under the License.
 package endpoint
 
 import (
+	"cmp"
 	"fmt"
 	"net/netip"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/utils/set"
 
+	"sigs.k8s.io/external-dns/internal/sets"
 	"sigs.k8s.io/external-dns/pkg/events"
 )
 
@@ -48,6 +52,16 @@ const (
 	RecordTypeMX = "MX"
 	// RecordTypeNAPTR is a RecordType enum value
 	RecordTypeNAPTR = "NAPTR"
+	// RecordTypeDNAME is a RecordType enum value
+	RecordTypeDNAME = "DNAME"
+
+	// ProviderSpecificAlias indicates whether a CNAME endpoint maps to a
+	// provider-native alias record (e.g. AWS ALIAS).
+	ProviderSpecificAlias = "alias"
+
+	// ProviderSpecificRecordType is the provider-specific property name used to
+	// request a particular DNS record type (e.g. "ptr") on an endpoint.
+	ProviderSpecificRecordType = "record-type"
 )
 
 var (
@@ -61,6 +75,7 @@ var (
 		RecordTypePTR,
 		RecordTypeMX,
 		RecordTypeNAPTR,
+		RecordTypeDNAME,
 	}
 )
 
@@ -81,20 +96,31 @@ type MXTarget struct {
 	host     string
 }
 
+// SRVTarget represents a single SRV record target, including its priority, weight, port, and host.
+type SRVTarget struct {
+	priority uint16
+	weight   uint16
+	port     uint16
+	host     string
+}
+
 // NewTargets is a convenience method to create a new Targets object from a vararg of strings.
 // Returns a new Targets slice with duplicates removed and elements sorted in order.
 func NewTargets(target ...string) Targets {
 	return set.New(target...).SortedList()
 }
 
+// String returns the targets joined by semicolons.
 func (t Targets) String() string {
 	return strings.Join(t, ";")
 }
 
+// Len returns the number of targets, satisfying sort.Interface.
 func (t Targets) Len() int {
 	return len(t)
 }
 
+// Less reports whether target i sorts before target j, using IP-aware comparison for valid addresses.
 func (t Targets) Less(i, j int) bool {
 	ipi, err := netip.ParseAddr(t[i])
 	if err != nil {
@@ -109,6 +135,7 @@ func (t Targets) Less(i, j int) bool {
 	return ipi.String() < ipj.String()
 }
 
+// Swap exchanges targets at positions i and j, satisfying sort.Interface.
 func (t Targets) Swap(i, j int) {
 	t[i], t[j] = t[j], t[i]
 }
@@ -222,6 +249,11 @@ type EndpointKey struct {
 	RecordType    string
 	SetIdentifier string
 	RecordTTL     TTL
+	Target        string
+}
+
+func (ep EndpointKey) String() string {
+	return fmt.Sprintf(`{%q %q %q "%d" %q}`, ep.DNSName, ep.RecordType, ep.SetIdentifier, ep.RecordTTL, ep.Target)
 }
 
 type ObjectRef = events.ObjectReference
@@ -245,10 +277,10 @@ type Endpoint struct {
 	// ProviderSpecific stores provider specific config
 	// +optional
 	ProviderSpecific ProviderSpecific `json:"providerSpecific,omitempty"`
-	// refObject stores reference object
-	// TODO: should be an array, as endpoints merged from multiple sources may have multiple ref objects
+	// refObjects stores the set of unique Kubernetes objects this endpoint was derived from.
+	// An endpoint merged from multiple sources will have more than one entry.
 	// +optional
-	refObject *ObjectRef `json:"-"`
+	refObjects []*ObjectRef `json:"-"`
 }
 
 // NewEndpoint initialization method to be used to create an endpoint
@@ -305,12 +337,50 @@ func (e *Endpoint) WithProviderSpecific(key, value string) *Endpoint {
 
 // GetProviderSpecificProperty returns the value of a ProviderSpecificProperty if the property exists.
 func (e *Endpoint) GetProviderSpecificProperty(key string) (string, bool) {
+	if len(e.ProviderSpecific) == 0 {
+		return "", false
+	}
 	for _, providerSpecific := range e.ProviderSpecific {
 		if providerSpecific.Name == key {
 			return providerSpecific.Value, true
 		}
 	}
 	return "", false
+}
+
+type AliasType string
+
+const (
+	// AliasNone indicates alias property is not set
+	AliasNone AliasType = ""
+	// AliasFalse indicates alias property is set to false
+	AliasFalse AliasType = "false"
+	// AliasTrue indicates alias property is set to true (both A and AAAA)
+	AliasTrue AliasType = "true"
+	// AliasA indicates alias property is set to A record only
+	AliasA AliasType = "A"
+	// AliasAAAA indicates alias property is set to AAAA record only
+	AliasAAAA AliasType = "AAAA"
+)
+
+func (e *Endpoint) GetAliasProperty() AliasType {
+	switch a, ok := e.GetProviderSpecificProperty("alias"); {
+	case a == "true" && ok:
+		return AliasTrue
+	case a == "false" && ok:
+		return AliasFalse
+	case a == "A" && ok:
+		return AliasA
+	case a == "AAAA" && ok:
+		return AliasAAAA
+	default:
+		return AliasNone
+	}
+}
+
+// WithAliasProperty sets the alias provider-specific property on the endpoint.
+func (e *Endpoint) WithAliasProperty(a AliasType) *Endpoint {
+	return e.WithProviderSpecific(ProviderSpecificAlias, string(a))
 }
 
 // GetBoolProviderSpecificProperty returns a boolean provider-specific property value.
@@ -331,6 +401,13 @@ func (e *Endpoint) GetBoolProviderSpecificProperty(key string) (bool, bool) {
 
 // SetProviderSpecificProperty sets the value of a ProviderSpecificProperty.
 func (e *Endpoint) SetProviderSpecificProperty(key string, value string) {
+	if len(e.ProviderSpecific) == 0 {
+		e.ProviderSpecific = append(e.ProviderSpecific, ProviderSpecificProperty{
+			Name:  key,
+			Value: value,
+		})
+		return
+	}
 	for i, providerSpecific := range e.ProviderSpecific {
 		if providerSpecific.Name == key {
 			e.ProviderSpecific[i] = ProviderSpecificProperty{
@@ -346,12 +423,38 @@ func (e *Endpoint) SetProviderSpecificProperty(key string, value string) {
 
 // DeleteProviderSpecificProperty deletes any ProviderSpecificProperty of the specified name.
 func (e *Endpoint) DeleteProviderSpecificProperty(key string) {
+	if len(e.ProviderSpecific) == 0 {
+		return
+	}
 	for i, providerSpecific := range e.ProviderSpecific {
 		if providerSpecific.Name == key {
 			e.ProviderSpecific = append(e.ProviderSpecific[:i], e.ProviderSpecific[i+1:]...)
 			return
 		}
 	}
+}
+
+// RetainProviderProperties retains only properties whose name is prefixed with
+// "provider/" (e.g. "aws/evaluate-target-health" for provider "aws").
+// Properties belonging to other providers are dropped.
+// Properties with no provider prefix (e.g. "alias") are provider-agnostic and always retained.
+// TODO: cloudflare does not follow the "provider/" prefix convention — its properties use the
+// annotation form "external-dns.kubernetes.io/cloudflare-*", so filtering is skipped for
+// cloudflare and all properties are retained (only sorted). This should be removed once cloudflare
+// adopts the standard prefix convention.
+func (e *Endpoint) RetainProviderProperties(provider string) {
+	if len(e.ProviderSpecific) == 0 {
+		return
+	}
+	if provider != "" && provider != "cloudflare" {
+		prefix := provider + "/"
+		e.ProviderSpecific = slices.DeleteFunc(e.ProviderSpecific, func(prop ProviderSpecificProperty) bool {
+			return strings.Contains(prop.Name, "/") && !strings.HasPrefix(prop.Name, prefix)
+		})
+	}
+	slices.SortFunc(e.ProviderSpecific, func(a, b ProviderSpecificProperty) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
 }
 
 // WithLabel adds or updates a label for the Endpoint.
@@ -367,15 +470,25 @@ func (e *Endpoint) WithLabel(key, value string) *Endpoint {
 	return e
 }
 
-// WithRefObject sets the reference object for the Endpoint and returns the Endpoint.
-// This can be used to associate the Endpoint with a specific Kubernetes object.
+// WithRefObject adds obj to the endpoint's set of reference objects, deduplicating by Key().
+// Calling it multiple times with the same object is safe — it is added at most once.
 func (e *Endpoint) WithRefObject(obj *events.ObjectReference) *Endpoint {
-	e.refObject = obj
+	if obj == nil {
+		return e
+	}
+	key := obj.Key()
+	if slices.ContainsFunc(e.refObjects, func(r *events.ObjectReference) bool {
+		return r.Key() == key
+	}) {
+		return e
+	}
+	e.refObjects = append(e.refObjects, obj)
 	return e
 }
 
-func (e *Endpoint) RefObject() *events.ObjectReference {
-	return e.refObject
+// RefObjects returns all Kubernetes object references associated with this endpoint.
+func (e *Endpoint) RefObjects() []*events.ObjectReference {
+	return e.refObjects
 }
 
 // Key returns the EndpointKey of the Endpoint.
@@ -393,10 +506,37 @@ func (e *Endpoint) IsOwnedBy(ownerID string) bool {
 	return ok && endpointOwner == ownerID
 }
 
+// GetNakedDomain returns the parent domain of the DNS name (without the first label).
+// For example, "www.example.com" returns "example.com".
+// For apex/two-label names like "example.com", the full name is returned unchanged.
+func (e *Endpoint) GetNakedDomain() string {
+	if e.DNSName == "" {
+		return ""
+	}
+	parts := strings.SplitN(e.DNSName, ".", 2)
+	if len(parts) < 2 || !strings.Contains(parts[1], ".") {
+		return e.DNSName
+	}
+	return parts[1]
+}
+
+// NewPTREndpoint creates a PTR endpoint from a forward IP target and one or more hostnames.
+// It computes the reverse DNS name (in-addr.arpa / ip6.arpa) from the target IP.
+func NewPTREndpoint(target string, ttl TTL, hostnames ...string) (*Endpoint, error) {
+	revAddr, err := dns.ReverseAddr(target)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute reverse address for %s: %w", target, err)
+	}
+	ptrName := strings.TrimSuffix(revAddr, ".")
+	return NewEndpointWithTTL(ptrName, RecordTypePTR, ttl, hostnames...), nil
+}
+
+// String returns a human-readable representation of the endpoint in zone-file style.
 func (e *Endpoint) String() string {
 	return fmt.Sprintf("%s %d IN %s %s %s %s", e.DNSName, e.RecordTTL, e.RecordType, e.SetIdentifier, e.Targets, e.ProviderSpecific)
 }
 
+// Describe returns a compact summary of the endpoint suitable for logging.
 func (e *Endpoint) Describe() string {
 	return fmt.Sprintf("record:%s, owner:%s, type:%s, targets:%s", e.DNSName, e.SetIdentifier, e.RecordType, strings.Join(e.Targets, ", "))
 }
@@ -424,15 +564,15 @@ func FilterEndpointsByOwnerID(ownerID string, eps []*Endpoint) []*Endpoint {
 // This function doesn't contemplate the Targets of an Endpoint
 // as part of the primary Key
 func RemoveDuplicates(endpoints []*Endpoint) []*Endpoint {
-	visited := make(map[EndpointKey]struct{})
+	visited := make(sets.Set[EndpointKey], len(endpoints))
 	result := []*Endpoint{}
 
 	for _, ep := range endpoints {
 		key := ep.Key()
 
-		if _, found := visited[key]; !found {
+		if !visited.Has(key) {
 			result = append(result, ep)
-			visited[key] = struct{}{}
+			visited.Insert(key)
 		} else {
 			log.Debugf(`Skipping duplicated endpoint: %v`, ep)
 		}
@@ -441,16 +581,50 @@ func RemoveDuplicates(endpoints []*Endpoint) []*Endpoint {
 	return result
 }
 
+// RequestedRecordType returns the value of the "record-type" provider-specific
+// property, following the same pattern as the alias accessor.
+func (e *Endpoint) RequestedRecordType() (string, bool) {
+	return e.GetProviderSpecificProperty(ProviderSpecificRecordType)
+}
+
 // TODO: rename to Validate
 // CheckEndpoint Check if endpoint is properly formatted according to RFC standards
 func (e *Endpoint) CheckEndpoint() bool {
+	if !e.supportsAlias() {
+		if _, ok := e.GetBoolProviderSpecificProperty(ProviderSpecificAlias); ok {
+			log.Warnf("Endpoint %s of type %s does not support alias records", e.DNSName, e.RecordType)
+			return false
+		}
+	}
+
 	switch recordType := e.RecordType; recordType {
+	case RecordTypeA, RecordTypeAAAA:
+		if !e.isAlias() {
+			return e.Targets.ValidateIPRecord(recordType)
+		}
 	case RecordTypeMX:
 		return e.Targets.ValidateMXRecord()
 	case RecordTypeSRV:
 		return e.Targets.ValidateSRVRecord()
+	case RecordTypePTR:
+		return e.ValidatePTRRecord()
 	}
 	return true
+}
+
+// isAlias returns true if the endpoint has the alias provider-specific property set to true.
+func (e *Endpoint) isAlias() bool {
+	val, ok := e.GetBoolProviderSpecificProperty(ProviderSpecificAlias)
+	return ok && val
+}
+
+func (e *Endpoint) supportsAlias() bool {
+	switch e.RecordType {
+	case RecordTypeA, RecordTypeAAAA, RecordTypeCNAME:
+		return true
+	default:
+		return false
+	}
 }
 
 // WithMinTTL sets the endpoint's TTL to the given value if the current TTL is not configured.
@@ -480,16 +654,89 @@ func NewMXRecord(target string) (*MXTarget, error) {
 	}, nil
 }
 
+// NewSRVRecord parses a string representation of an SRV record target (e.g., "10 5 5060 example.com.")
+// and returns an SRVTarget struct. Returns an error if the input is invalid.
+func NewSRVRecord(target string) (*SRVTarget, error) {
+	parts := strings.Fields(strings.TrimSpace(target))
+	if len(parts) != 4 {
+		return nil, fmt.Errorf("invalid SRV record target: %s. SRV records must have a priority, weight, port, and target host, e.g. '10 5 5060 example.com.'", target)
+	}
+	if !strings.HasSuffix(parts[3], ".") {
+		return nil, fmt.Errorf("invalid SRV record target: %s. Target host does not end with a dot", target)
+	}
+
+	priority, err := strconv.ParseUint(parts[0], 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SRV priority %q: %w", parts[0], err)
+	}
+	weight, err := strconv.ParseUint(parts[1], 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SRV weight %q: %w", parts[1], err)
+	}
+	port, err := strconv.ParseUint(parts[2], 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SRV port %q: %w", parts[2], err)
+	}
+
+	return &SRVTarget{
+		priority: uint16(priority),
+		weight:   uint16(weight),
+		port:     uint16(port),
+		host:     parts[3],
+	}, nil
+}
+
 // GetPriority returns the priority of the MX record target.
 func (m *MXTarget) GetPriority() *uint16 {
 	return &m.priority
 }
 
 // GetHost returns the host of the MX record target.
-func (m *MXTarget) GetHost() *string {
-	return &m.host
+func (m *MXTarget) GetHost() string {
+	return m.host
 }
 
+// GetPriority returns the priority of the SRV record target.
+func (s *SRVTarget) GetPriority() uint16 {
+	return s.priority
+}
+
+// GetWeight returns the weight of the SRV record target.
+func (s *SRVTarget) GetWeight() uint16 {
+	return s.weight
+}
+
+// GetPort returns the port of the SRV record target.
+func (s *SRVTarget) GetPort() uint16 {
+	return s.port
+}
+
+// GetHost returns the host of the SRV record target.
+func (s *SRVTarget) GetHost() string {
+	return s.host
+}
+
+// ValidateIPRecord reports whether all targets are valid IP addresses of the given record type (A or AAAA).
+func (t Targets) ValidateIPRecord(recordType string) bool {
+	for _, target := range t {
+		addr, err := netip.ParseAddr(target)
+		if err != nil {
+			log.Debugf("Invalid %s record target: %s is not a valid IP address", recordType, target)
+			return false
+		}
+		if recordType == RecordTypeA && addr.Is6() {
+			log.Debugf("Invalid A record target: %s is an IPv6 address", target)
+			return false
+		}
+		if recordType == RecordTypeAAAA && addr.Is4() {
+			log.Debugf("Invalid AAAA record target: %s is an IPv4 address", target)
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateMXRecord reports whether all targets are valid MX record values (priority + host).
 func (t Targets) ValidateMXRecord() bool {
 	for _, target := range t {
 		_, err := NewMXRecord(target)
@@ -502,29 +749,52 @@ func (t Targets) ValidateMXRecord() bool {
 	return true
 }
 
+// ValidateSRVRecord reports whether all targets are valid SRV record values (priority weight port host).
 func (t Targets) ValidateSRVRecord() bool {
 	for _, target := range t {
-		// SRV records must have a priority, weight, a port value and a target e.g. "10 5 5060 example.com."
-		// as per https://www.rfc-editor.org/rfc/rfc2782.txt the target host has to end with a dot.
-		targetParts := strings.Fields(strings.TrimSpace(target))
-		if len(targetParts) != 4 {
-			log.Debugf("Invalid SRV record target: %s. SRV records must have a priority, weight, a port value and a target host, e.g. '10 5 5060 example.com.'", target)
+		_, err := NewSRVRecord(target)
+		if err != nil {
+			log.Debugf("Invalid SRV record target: %s. %v", target, err)
 			return false
-		}
-		if !strings.HasSuffix(targetParts[3], ".") {
-			log.Debugf("Invalid SRV record target: %s. Target host does not end with a dot.'", target)
-			return false
-		}
-
-		for _, part := range targetParts[:3] {
-			_, err := strconv.ParseUint(part, 10, 16)
-			if err != nil {
-				log.Debugf("Invalid SRV record target: %s. Invalid integer value in target.", target)
-				return false
-			}
 		}
 	}
 	return true
+}
+
+// ValidatePTRRecord checks that a PTR endpoint has a valid reverse DNS name
+// (ending in .in-addr.arpa or .ip6.arpa) and that targets are non-empty hostnames.
+func (e *Endpoint) ValidatePTRRecord() bool {
+	name := strings.ToLower(e.DNSName)
+	if !isReverseDNSName(name) {
+		log.Debugf("Invalid PTR record: DNSName %q must be a valid reverse DNS name under .in-addr.arpa or .ip6.arpa", e.DNSName)
+		return false
+	}
+	if len(e.Targets) == 0 {
+		log.Debugf("Invalid PTR record: at least one target is required for %s", e.DNSName)
+		return false
+	}
+	for _, target := range e.Targets {
+		if strings.TrimSpace(target) == "" {
+			log.Debugf("Invalid PTR record: target must not be empty for %s", e.DNSName)
+			return false
+		}
+		if _, err := netip.ParseAddr(target); err == nil {
+			log.Debugf("Invalid PTR record: target %q for %s must be a hostname, not an IP address", target, e.DNSName)
+			return false
+		}
+	}
+	return true
+}
+
+// isReverseDNSName checks that name ends with .in-addr.arpa or .ip6.arpa
+// and has at least one label before the suffix.
+func isReverseDNSName(name string) bool {
+	for _, suffix := range []string{".in-addr.arpa", ".ip6.arpa"} {
+		if prefix, ok := strings.CutSuffix(name, suffix); ok {
+			return len(prefix) > 0 && prefix[0] != '.'
+		}
+	}
+	return false
 }
 
 // GetDNSName returns the DNS name of the endpoint.
