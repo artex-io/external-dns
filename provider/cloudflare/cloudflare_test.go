@@ -18,18 +18,22 @@ package cloudflare
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
-	"github.com/cloudflare/cloudflare-go/v5"
-	"github.com/cloudflare/cloudflare-go/v5/dns"
-	"github.com/cloudflare/cloudflare-go/v5/zones"
+	"github.com/cloudflare/cloudflare-go/v7"
+	"github.com/cloudflare/cloudflare-go/v7/dns"
+	"github.com/cloudflare/cloudflare-go/v7/option"
+	"github.com/cloudflare/cloudflare-go/v7/zones"
 	"github.com/maxatome/go-testdeep/td"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -37,6 +41,7 @@ import (
 
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/internal/testutils"
+	logtest "sigs.k8s.io/external-dns/internal/testutils/log"
 	"sigs.k8s.io/external-dns/plan"
 	"sigs.k8s.io/external-dns/provider"
 	"sigs.k8s.io/external-dns/source/annotations"
@@ -99,6 +104,7 @@ type mockCloudFlareClient struct {
 	Zones                map[string]string
 	Records              map[string]map[string]dns.RecordResponse
 	Actions              []MockAction
+	BatchDNSRecordsCalls int
 	listZonesError       error // For v4 ListZones
 	getZoneError         error // For v4 GetZone
 	dnsRecordsError      error
@@ -136,18 +142,80 @@ func NewMockCloudFlareClientWithRecords(records map[string][]dns.RecordResponse)
 	return m
 }
 
-func (m *mockCloudFlareClient) CreateDNSRecord(_ context.Context, params dns.RecordNewParams) (*dns.RecordResponse, error) {
-	body := params.Body.(dns.RecordNewParamsBody)
+func srvContentFromParam(data dns.SRVRecordDataParam) string {
+	return fmt.Sprintf("%v %v %v %s",
+		data.Priority.Value,
+		data.Weight.Value,
+		data.Port.Value,
+		externalDNSSRVTarget(data.Target.Value),
+	)
+}
 
-	record := dns.RecordResponse{
-		ID:       generateDNSRecordID(body.Type.String(), body.Name.Value, body.Content.Value),
-		Name:     body.Name.Value,
-		TTL:      dns.TTL(body.TTL.Value),
-		Proxied:  body.Proxied.Value,
-		Type:     dns.RecordResponseType(body.Type.String()),
-		Content:  body.Content.Value,
-		Priority: body.Priority.Value,
+func srvDataFromParam(data dns.SRVRecordDataParam) dns.SRVRecordData {
+	return dns.SRVRecordData{
+		Priority: data.Priority.Value,
+		Weight:   data.Weight.Value,
+		Port:     data.Port.Value,
+		Target:   data.Target.Value,
 	}
+}
+
+func recordResponseFromNewBody(body dns.RecordNewParamsBodyUnion) dns.RecordResponse {
+	switch b := body.(type) {
+	case dns.SRVRecordParam:
+		return dns.RecordResponse{
+			ID:      generateDNSRecordID(string(b.Type.Value), b.Name.Value, srvContentFromParam(b.Data.Value)),
+			Name:    b.Name.Value,
+			TTL:     b.TTL.Value,
+			Proxied: b.Proxied.Value,
+			Type:    dns.RecordResponseType(b.Type.Value),
+			Content: srvContentFromParam(b.Data.Value),
+			Data:    srvDataFromParam(b.Data.Value),
+		}
+	case dns.RecordNewParamsBody:
+		return dns.RecordResponse{
+			ID:       generateDNSRecordID(b.Type.String(), b.Name.Value, b.Content.Value),
+			Name:     b.Name.Value,
+			TTL:      dns.TTL(b.TTL.Value),
+			Proxied:  b.Proxied.Value,
+			Type:     dns.RecordResponseType(b.Type.String()),
+			Content:  b.Content.Value,
+			Priority: b.Priority.Value,
+		}
+	default:
+		panic(fmt.Sprintf("recordResponseFromNewBody: unexpected body type %T", body))
+	}
+}
+
+func recordResponseFromUpdateBody(recordID string, body dns.RecordUpdateParamsBodyUnion) dns.RecordResponse {
+	switch b := body.(type) {
+	case dns.SRVRecordParam:
+		return dns.RecordResponse{
+			ID:      recordID,
+			Name:    b.Name.Value,
+			TTL:     b.TTL.Value,
+			Proxied: b.Proxied.Value,
+			Type:    dns.RecordResponseType(b.Type.Value),
+			Content: srvContentFromParam(b.Data.Value),
+			Data:    srvDataFromParam(b.Data.Value),
+		}
+	case dns.RecordUpdateParamsBody:
+		return dns.RecordResponse{
+			ID:       recordID,
+			Name:     b.Name.Value,
+			TTL:      dns.TTL(b.TTL.Value),
+			Proxied:  b.Proxied.Value,
+			Type:     dns.RecordResponseType(b.Type.String()),
+			Content:  b.Content.Value,
+			Priority: b.Priority.Value,
+		}
+	default:
+		panic(fmt.Sprintf("recordResponseFromUpdateBody: unexpected body type %T", body))
+	}
+}
+
+func (m *mockCloudFlareClient) CreateDNSRecord(_ context.Context, params dns.RecordNewParams) (*dns.RecordResponse, error) {
+	record := recordResponseFromNewBody(params.Body)
 
 	m.Actions = append(m.Actions, MockAction{
 		Name:       "Create",
@@ -186,17 +254,7 @@ func (m *mockCloudFlareClient) ListDNSRecords(ctx context.Context, params dns.Re
 
 func (m *mockCloudFlareClient) UpdateDNSRecord(_ context.Context, recordID string, params dns.RecordUpdateParams) (*dns.RecordResponse, error) {
 	zoneID := params.ZoneID.String()
-	body := params.Body.(dns.RecordUpdateParamsBody)
-
-	record := dns.RecordResponse{
-		ID:       recordID,
-		Name:     body.Name.Value,
-		TTL:      dns.TTL(body.TTL.Value),
-		Proxied:  body.Proxied.Value,
-		Type:     dns.RecordResponseType(body.Type.String()),
-		Content:  body.Content.Value,
-		Priority: body.Priority.Value,
-	}
+	record := recordResponseFromUpdateBody(recordID, params.Body)
 
 	m.Actions = append(m.Actions, MockAction{
 		Name:       "Update",
@@ -555,7 +613,7 @@ func TestCloudflareProxiedOverrideTrue(t *testing.T) {
 			Targets:    endpoint.Targets{"127.0.0.1"},
 			ProviderSpecific: endpoint.ProviderSpecific{
 				endpoint.ProviderSpecificProperty{
-					Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+					Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 					Value: "true",
 				},
 			},
@@ -589,7 +647,7 @@ func TestCloudflareProxiedOverrideFalse(t *testing.T) {
 			Targets:    endpoint.Targets{"127.0.0.1"},
 			ProviderSpecific: endpoint.ProviderSpecific{
 				endpoint.ProviderSpecificProperty{
-					Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+					Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 					Value: "false",
 				},
 			},
@@ -623,7 +681,7 @@ func TestCloudflareProxiedOverrideIllegal(t *testing.T) {
 			Targets:    endpoint.Targets{"127.0.0.1"},
 			ProviderSpecific: endpoint.ProviderSpecific{
 				endpoint.ProviderSpecificProperty{
-					Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+					Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 					Value: "asfasdfa",
 				},
 			},
@@ -672,11 +730,15 @@ func TestCloudflareSetProxied(t *testing.T) {
 			var content string
 			var priority float64
 
-			if testCase.recordType == "MX" {
+			switch testCase.recordType {
+			case "MX":
 				targets = endpoint.Targets{"10 mx.example.com"}
 				content = "mx.example.com"
 				priority = 10
-			} else {
+			case "SRV":
+				targets = endpoint.Targets{"0 1 443 target.bar.com."}
+				content = "0 1 443 target.bar.com."
+			default:
 				targets = endpoint.Targets{"127.0.0.1"}
 				content = "127.0.0.1"
 			}
@@ -688,7 +750,7 @@ func TestCloudflareSetProxied(t *testing.T) {
 					Targets:    endpoint.Targets{targets[0]},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						endpoint.ProviderSpecificProperty{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+							Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 							Value: "true",
 						},
 					},
@@ -703,8 +765,16 @@ func TestCloudflareSetProxied(t *testing.T) {
 				TTL:     1,
 				Proxied: testCase.proxiable,
 			}
-			if testCase.recordType == "MX" {
+			switch testCase.recordType {
+			case "MX":
 				recordData.Priority = priority
+			case "SRV":
+				recordData.Data = dns.SRVRecordData{
+					Priority: 0,
+					Weight:   1,
+					Port:     443,
+					Target:   "target.bar.com",
+				}
 			}
 			AssertActions(t, &CloudFlareProvider{}, endpoints, []MockAction{
 				{
@@ -962,7 +1032,7 @@ func TestCloudflareProvider(t *testing.T) {
 				t.Setenv(env.Key, env.Value)
 			}
 
-			_, err = NewCloudFlareProvider(
+			_, err = newProvider(
 				endpoint.NewDomainFilter([]string{"bar.com"}),
 				provider.NewZoneIDFilter([]string{""}),
 				false,
@@ -979,6 +1049,56 @@ func TestCloudflareProvider(t *testing.T) {
 			}
 		})
 
+	}
+}
+
+func TestResolveAPIToken(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "cf_api_token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("abc123def\n"), 0o600))
+
+	testCases := []struct {
+		Name       string
+		Token      string
+		Expected   string
+		ShouldFail bool
+	}{
+		{
+			Name:     "plain token",
+			Token:    "abc123def",
+			Expected: "abc123def",
+		},
+		{
+			Name:     "token with trailing newline",
+			Token:    "abc123def\n",
+			Expected: "abc123def",
+		},
+		{
+			Name:     "token with surrounding whitespace",
+			Token:    "  abc123def\r\n",
+			Expected: "abc123def",
+		},
+		{
+			Name:     "token from file is trimmed",
+			Token:    "file:" + tokenFile,
+			Expected: "abc123def",
+		},
+		{
+			Name:       "missing file",
+			Token:      "file:/does/not/exist",
+			ShouldFail: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			resolved, err := resolveAPIToken(tc.Token)
+			if tc.ShouldFail {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.Expected, resolved)
+		})
 	}
 }
 
@@ -1178,7 +1298,7 @@ func TestCloudflareGroupByNameAndTypeWithCustomHostnames(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+							Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 							Value: "false",
 						},
 					},
@@ -1212,7 +1332,7 @@ func TestCloudflareGroupByNameAndTypeWithCustomHostnames(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+							Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 							Value: "false",
 						},
 					},
@@ -1260,7 +1380,7 @@ func TestCloudflareGroupByNameAndTypeWithCustomHostnames(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+							Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 							Value: "false",
 						},
 					},
@@ -1273,7 +1393,7 @@ func TestCloudflareGroupByNameAndTypeWithCustomHostnames(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+							Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 							Value: "false",
 						},
 					},
@@ -1314,7 +1434,7 @@ func TestCloudflareGroupByNameAndTypeWithCustomHostnames(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+							Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 							Value: "false",
 						},
 					},
@@ -1327,7 +1447,7 @@ func TestCloudflareGroupByNameAndTypeWithCustomHostnames(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+							Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 							Value: "false",
 						},
 					},
@@ -1368,7 +1488,7 @@ func TestCloudflareGroupByNameAndTypeWithCustomHostnames(t *testing.T) {
 					Labels:     endpoint.Labels{},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+							Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 							Value: "false",
 						},
 					},
@@ -1652,7 +1772,7 @@ func TestCloudflareComplexUpdate(t *testing.T) {
 			Labels:     endpoint.Labels{},
 			ProviderSpecific: endpoint.ProviderSpecific{
 				{
-					Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+					Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 					Value: "true",
 				},
 			},
@@ -1680,19 +1800,6 @@ func TestCloudflareComplexUpdate(t *testing.T) {
 			RecordId: "2345678901",
 		},
 		{
-			Name:     "Create",
-			ZoneId:   "001",
-			RecordId: generateDNSRecordID("A", "foobar.bar.com", "2.3.4.5"),
-			RecordData: dns.RecordResponse{
-				ID:      generateDNSRecordID("A", "foobar.bar.com", "2.3.4.5"),
-				Name:    "foobar.bar.com",
-				Type:    "A",
-				Content: "2.3.4.5",
-				TTL:     1,
-				Proxied: true,
-			},
-		},
-		{
 			Name:     "Update",
 			ZoneId:   "001",
 			RecordId: "1234567890",
@@ -1701,6 +1808,19 @@ func TestCloudflareComplexUpdate(t *testing.T) {
 				Name:    "foobar.bar.com",
 				Type:    "A",
 				Content: "1.2.3.4",
+				TTL:     1,
+				Proxied: true,
+			},
+		},
+		{
+			Name:     "Create",
+			ZoneId:   "001",
+			RecordId: generateDNSRecordID("A", "foobar.bar.com", "2.3.4.5"),
+			RecordData: dns.RecordResponse{
+				ID:      generateDNSRecordID("A", "foobar.bar.com", "2.3.4.5"),
+				Name:    "foobar.bar.com",
+				Type:    "A",
+				Content: "2.3.4.5",
 				TTL:     1,
 				Proxied: true,
 			},
@@ -1740,7 +1860,7 @@ func TestCustomTTLWithEnabledProxyNotChanged(t *testing.T) {
 			Labels:     endpoint.Labels{},
 			ProviderSpecific: endpoint.ProviderSpecific{
 				{
-					Name:  "external-dns.alpha.kubernetes.io/cloudflare-proxied",
+					Name:  "external-dns.kubernetes.io/cloudflare-proxied",
 					Value: "true",
 				},
 			},
@@ -1770,7 +1890,7 @@ func TestCloudFlareProvider_Region(t *testing.T) {
 		cfAPITokenEnvKey: "abc123def",
 		cfAPIEmailEnvKey: "test@test.com",
 	})
-	provider, err := NewCloudFlareProvider(
+	provider, err := newProvider(
 		endpoint.NewDomainFilter([]string{"example.com"}),
 		provider.ZoneIDFilter{},
 		true,
@@ -1897,6 +2017,18 @@ func TestCloudFlareProvider_newCloudFlareChange(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("invalid SRV target returns an error", func(t *testing.T) {
+		ep := &endpoint.Endpoint{
+			DNSName:    "_caldavs._tcp.example.com",
+			RecordType: "SRV",
+			Targets:    []string{"caldav.fastmail.com."},
+		}
+
+		_, err := freeProvider.newCloudFlareChange(cloudFlareCreate, ep, ep.Targets[0], nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse SRV record target")
+	})
 }
 
 func TestCloudFlareProvider_submitChangesCNAME(t *testing.T) {
@@ -2056,7 +2188,7 @@ func TestCloudflareLongRecordsErrorLog(t *testing.T) {
 			},
 		},
 	})
-	hook := testutils.LogsUnderTestWithLogLevel(log.InfoLevel, t)
+	hook := logtest.LogsUnderTestWithLogLevel(log.InfoLevel, t)
 	p := &CloudFlareProvider{
 		Client:                client,
 		CustomHostnamesConfig: CustomHostnamesConfig{Enabled: true},
@@ -2066,7 +2198,7 @@ func TestCloudflareLongRecordsErrorLog(t *testing.T) {
 	if err != nil {
 		t.Errorf("should not fail - too long record, %s", err)
 	}
-	testutils.TestHelperLogContains("s longer than 63 characters. Cannot create endpoint", hook, t)
+	logtest.TestHelperLogContains("s longer than 63 characters. Cannot create endpoint", hook, t)
 }
 
 // check if the error is expected
@@ -2220,7 +2352,7 @@ func TestZoneHasPaidPlan(t *testing.T) {
 }
 
 func TestCloudflareApplyChanges_AllErrorLogPaths(t *testing.T) {
-	hook := testutils.LogsUnderTestWithLogLevel(log.ErrorLevel, t)
+	hook := logtest.LogsUnderTestWithLogLevel(log.ErrorLevel, t)
 
 	client := NewMockCloudFlareClient()
 	provider := &CloudFlareProvider{
@@ -2242,7 +2374,7 @@ func TestCloudflareApplyChanges_AllErrorLogPaths(t *testing.T) {
 					Targets:    endpoint.Targets{"not-a-valid-mx"},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "bad-create-custom.bar.com",
 						},
 					},
@@ -2260,7 +2392,7 @@ func TestCloudflareApplyChanges_AllErrorLogPaths(t *testing.T) {
 					Targets:    endpoint.Targets{"not-a-valid-mx"},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "bad-delete-custom.bar.com",
 						},
 					},
@@ -2278,7 +2410,7 @@ func TestCloudflareApplyChanges_AllErrorLogPaths(t *testing.T) {
 					Targets:    endpoint.Targets{"not-a-valid-mx"},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "bad-update-add-custom.bar.com",
 						},
 					},
@@ -2289,7 +2421,7 @@ func TestCloudflareApplyChanges_AllErrorLogPaths(t *testing.T) {
 					Targets:    endpoint.Targets{"not-a-valid-mx-but-still-updated"},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "bad-update-add-custom.bar.com",
 						},
 					},
@@ -2307,7 +2439,7 @@ func TestCloudflareApplyChanges_AllErrorLogPaths(t *testing.T) {
 					Targets:    endpoint.Targets{"not-a-valid-mx"},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "bad-update-leave-custom.bar.com",
 						},
 					},
@@ -2318,7 +2450,7 @@ func TestCloudflareApplyChanges_AllErrorLogPaths(t *testing.T) {
 					Targets:    endpoint.Targets{"not-a-valid-mx"},
 					ProviderSpecific: endpoint.ProviderSpecific{
 						{
-							Name:  "external-dns.alpha.kubernetes.io/cloudflare-custom-hostname",
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
 							Value: "bad-update-leave-custom.bar.com",
 						},
 					},
@@ -2388,6 +2520,45 @@ func TestCloudFlareProvider_SupportedAdditionalRecordTypes(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestEndpointTargetFromCloudflareRecordSRV(t *testing.T) {
+	t.Run("normalizes typed SRV data", func(t *testing.T) {
+		record := dns.RecordResponse{
+			Type: dns.RecordResponseTypeSRV,
+			Data: dns.SRVRecordData{
+				Priority: 0,
+				Weight:   1,
+				Port:     443,
+				Target:   "caldav.fastmail.com",
+			},
+		}
+
+		assert.Equal(t, "0 1 443 caldav.fastmail.com.", endpointTargetFromCloudflareRecord(record))
+	})
+
+	t.Run("falls back to content without typed SRV data", func(t *testing.T) {
+		record := dns.RecordResponse{
+			Type:    dns.RecordResponseTypeSRV,
+			Content: "10 20 995 pop.fastmail.com.",
+		}
+
+		assert.Equal(t, "10 20 995 pop.fastmail.com.", endpointTargetFromCloudflareRecord(record))
+	})
+
+	t.Run("keeps service-unavailable root target", func(t *testing.T) {
+		record := dns.RecordResponse{
+			Type: dns.RecordResponseTypeSRV,
+			Data: dns.SRVRecordData{
+				Priority: 0,
+				Weight:   0,
+				Port:     0,
+				Target:   ".",
+			},
+		}
+
+		assert.Equal(t, "0 0 0 .", endpointTargetFromCloudflareRecord(record))
+	})
 }
 
 func TestCloudflareZoneChanges(t *testing.T) {
@@ -2627,6 +2798,24 @@ func TestConvertCloudflareError(t *testing.T) {
 			description:     "Server error (503) should be converted to soft error",
 		},
 		{
+			name:            "io.ErrUnexpectedEOF is soft",
+			inputError:      io.ErrUnexpectedEOF,
+			expectSoftError: true,
+			description:     "Unexpected EOF (connection closed mid-response) should be converted to soft error",
+		},
+		{
+			name:            "io.EOF is soft",
+			inputError:      io.EOF,
+			expectSoftError: true,
+			description:     "EOF (connection closed before response) should be converted to soft error",
+		},
+		{
+			name:            "wrapped io.ErrUnexpectedEOF is soft",
+			inputError:      fmt.Errorf("transport error: %w", io.ErrUnexpectedEOF),
+			expectSoftError: true,
+			description:     "Wrapped unexpected EOF should be converted to soft error",
+		},
+		{
 			name:            "Rate limit string error",
 			inputError:      errors.New("exceeded available rate limit retries"),
 			expectSoftError: true,
@@ -2802,7 +2991,7 @@ func TestCloudFlareZonesDomainFilter(t *testing.T) {
 	}
 
 	// Capture debug logs to verify the filter log message
-	hook := testutils.LogsUnderTestWithLogLevel(log.DebugLevel, t)
+	hook := logtest.LogsUnderTestWithLogLevel(log.DebugLevel, t)
 
 	// Call Zones() which should trigger the domain filter logic
 	zones, err := p.Zones(t.Context())
@@ -2814,8 +3003,8 @@ func TestCloudFlareZonesDomainFilter(t *testing.T) {
 	assert.Equal(t, "001", zones[0].ID)
 
 	// Verify that the debug log was written for the filtered zone
-	testutils.TestHelperLogContains("zone \"foo.com\" not in domain filter", hook, t)
-	testutils.TestHelperLogContains("no zoneIDFilter configured, looking at all zones", hook, t)
+	logtest.TestHelperLogContains("zone \"foo.com\" not in domain filter", hook, t)
+	logtest.TestHelperLogContains("no zoneIDFilter configured, looking at all zones", hook, t)
 }
 
 func TestZoneIDByNameIteratorError(t *testing.T) {
@@ -2867,7 +3056,8 @@ func TestGetUpdateDNSRecordParam(t *testing.T) {
 		},
 	}
 
-	params := getUpdateDNSRecordParam("zone-123", cfc)
+	params, err := getUpdateDNSRecordParam("zone-123", cfc)
+	require.NoError(t, err)
 	body := params.Body.(dns.RecordUpdateParamsBody)
 
 	assert.Equal(t, "zone-123", params.ZoneID.Value)
@@ -2878,6 +3068,72 @@ func TestGetUpdateDNSRecordParam(t *testing.T) {
 	assert.Equal(t, "1.2.3.4", body.Content.Value)
 	assert.InDelta(t, 10, float64(body.Priority.Value), 0)
 	assert.Equal(t, "test-comment", body.Comment.Value)
+}
+
+func TestGetDNSRecordParamsSRV(t *testing.T) {
+	cfc := cloudFlareChange{
+		ResourceRecord: dns.RecordResponse{
+			ID:      "1234",
+			Name:    "_caldavs._tcp.example.com",
+			Type:    dns.RecordResponseTypeSRV,
+			TTL:     120,
+			Content: "0 1 443 caldav.fastmail.com.",
+			Comment: "test-comment",
+		},
+	}
+
+	t.Run("create uses structured SRV data", func(t *testing.T) {
+		params, err := getCreateDNSRecordParam("zone-123", &cfc)
+		require.NoError(t, err)
+		body, ok := params.Body.(dns.SRVRecordParam)
+		require.True(t, ok)
+
+		assert.Equal(t, "zone-123", params.ZoneID.Value)
+		assert.Equal(t, "_caldavs._tcp.example.com", body.Name.Value)
+		assert.Equal(t, dns.SRVRecordTypeSRV, body.Type.Value)
+		assert.InDelta(t, 0, body.Data.Value.Priority.Value, 0)
+		assert.InDelta(t, 1, body.Data.Value.Weight.Value, 0)
+		assert.InDelta(t, 443, body.Data.Value.Port.Value, 0)
+		assert.Equal(t, "caldav.fastmail.com", body.Data.Value.Target.Value)
+		assert.Equal(t, "test-comment", body.Comment.Value)
+
+		bodyJSON, err := json.Marshal(params.Body)
+		require.NoError(t, err)
+		assert.Contains(t, string(bodyJSON), `"data"`)
+		assert.Contains(t, string(bodyJSON), `"target":"caldav.fastmail.com"`)
+		assert.NotContains(t, string(bodyJSON), `"content"`)
+	})
+
+	t.Run("update uses structured SRV data", func(t *testing.T) {
+		params, err := getUpdateDNSRecordParam("zone-123", cfc)
+		require.NoError(t, err)
+		body, ok := params.Body.(dns.SRVRecordParam)
+		require.True(t, ok)
+
+		assert.Equal(t, "zone-123", params.ZoneID.Value)
+		assert.Equal(t, "_caldavs._tcp.example.com", body.Name.Value)
+		assert.Equal(t, dns.SRVRecordTypeSRV, body.Type.Value)
+		assert.InDelta(t, 0, body.Data.Value.Priority.Value, 0)
+		assert.InDelta(t, 1, body.Data.Value.Weight.Value, 0)
+		assert.InDelta(t, 443, body.Data.Value.Port.Value, 0)
+		assert.Equal(t, "caldav.fastmail.com", body.Data.Value.Target.Value)
+		assert.Equal(t, "test-comment", body.Comment.Value)
+
+		bodyJSON, err := json.Marshal(params.Body)
+		require.NoError(t, err)
+		assert.Contains(t, string(bodyJSON), `"data"`)
+		assert.Contains(t, string(bodyJSON), `"target":"caldav.fastmail.com"`)
+		assert.NotContains(t, string(bodyJSON), `"content"`)
+	})
+
+	t.Run("malformed SRV create returns an error", func(t *testing.T) {
+		badChange := cfc
+		badChange.ResourceRecord.Content = "caldav.fastmail.com."
+
+		_, err := getCreateDNSRecordParam("zone-123", &badChange)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse SRV record target")
+	})
 }
 
 func TestZoneService(t *testing.T) {
@@ -2902,7 +3158,8 @@ func TestZoneService(t *testing.T) {
 
 	t.Run("CreateDNSRecord", func(t *testing.T) {
 		t.Parallel()
-		params := getCreateDNSRecordParam(zoneID, &cloudFlareChange{})
+		params, err := getCreateDNSRecordParam(zoneID, &cloudFlareChange{})
+		require.NoError(t, err)
 		record, err := client.CreateDNSRecord(ctx, params)
 		assert.Empty(t, record)
 		assert.ErrorIs(t, err, context.Canceled)
@@ -2910,8 +3167,9 @@ func TestZoneService(t *testing.T) {
 
 	t.Run("UpdateDNSRecord", func(t *testing.T) {
 		t.Parallel()
-		recordParam := getUpdateDNSRecordParam(zoneID, cloudFlareChange{})
-		_, err := client.UpdateDNSRecord(ctx, "1234", recordParam)
+		recordParam, err := getUpdateDNSRecordParam(zoneID, cloudFlareChange{})
+		require.NoError(t, err)
+		_, err = client.UpdateDNSRecord(ctx, "1234", recordParam)
 		assert.ErrorIs(t, err, context.Canceled)
 	})
 
@@ -2979,8 +3237,226 @@ func TestZoneService(t *testing.T) {
 		err := client.CreateCustomHostname(ctx, zoneID, customHostname{})
 		assert.ErrorIs(t, err, context.Canceled)
 	})
+
+	t.Run("BatchDNSRecords", func(t *testing.T) {
+		t.Parallel()
+		_, err := client.BatchDNSRecords(ctx, dns.RecordBatchParams{ZoneID: cloudflare.F(zoneID)})
+		assert.ErrorIs(t, err, context.Canceled)
+	})
 }
 
-func generateDNSRecordID(rrtype string, name string, content string) string {
-	return fmt.Sprintf("%s-%s-%s", name, rrtype, content)
+func TestSubmitChanges_ErrorPaths(t *testing.T) {
+	t.Run("getDNSRecordsMap error returns error from submitChanges", func(t *testing.T) {
+		client := NewMockCloudFlareClient()
+		client.dnsRecordsError = errors.New("dns list failed")
+		p := &CloudFlareProvider{Client: client}
+
+		changes := &plan.Changes{
+			Create: []*endpoint.Endpoint{
+				{DNSName: "test.bar.com", Targets: endpoint.Targets{"1.2.3.4"}, RecordType: "A"},
+			},
+		}
+		err := p.ApplyChanges(t.Context(), changes)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "could not fetch records from zone")
+	})
+
+	t.Run("listCustomHostnamesWithPagination error returns error from submitChanges", func(t *testing.T) {
+		// The mock returns an error for CustomHostnames() when zoneID starts with "newerror-".
+		// CustomHostnamesConfig.Enabled must be true to reach that code path.
+		client := &mockCloudFlareClient{
+			Zones: map[string]string{
+				"newerror-zone1": "errorcf.com",
+			},
+			Records: map[string]map[string]dns.RecordResponse{
+				"newerror-zone1": {},
+			},
+			customHostnames:   map[string][]customHostname{},
+			regionalHostnames: map[string][]regionalHostname{},
+		}
+		p := &CloudFlareProvider{
+			Client:                client,
+			domainFilter:          endpoint.NewDomainFilter([]string{"errorcf.com"}),
+			CustomHostnamesConfig: CustomHostnamesConfig{Enabled: true},
+		}
+
+		changes := &plan.Changes{
+			Create: []*endpoint.Endpoint{
+				{DNSName: "sub.errorcf.com", Targets: endpoint.Targets{"1.2.3.4"}, RecordType: "A"},
+			},
+		}
+		err := p.ApplyChanges(t.Context(), changes)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "could not fetch custom hostnames from zone")
+	})
+
+	t.Run("processCustomHostnameChanges failure sets failedChange", func(t *testing.T) {
+		// The mock's CreateCustomHostname fails for "newerror-create.foo.fancybar.com".
+		// With CustomHostnames enabled, the failing create causes processCustomHostnameChanges
+		// to return true, which sets failedChange=true for the zone.
+		client := NewMockCloudFlareClient()
+		p := &CloudFlareProvider{
+			Client:                client,
+			CustomHostnamesConfig: CustomHostnamesConfig{Enabled: true},
+		}
+
+		changes := &plan.Changes{
+			Create: []*endpoint.Endpoint{
+				{
+					DNSName:    "a.bar.com",
+					Targets:    endpoint.Targets{"1.2.3.4"},
+					RecordType: "A",
+					ProviderSpecific: endpoint.ProviderSpecific{
+						{
+							Name:  "external-dns.kubernetes.io/cloudflare-custom-hostname",
+							Value: "newerror-create.foo.fancybar.com",
+						},
+					},
+				},
+			},
+		}
+		err := p.ApplyChanges(t.Context(), changes)
+		require.Error(t, err, "failing custom hostname create should cause an error")
+	})
+
+	t.Run("Zones error propagates from submitChanges", func(t *testing.T) {
+		// Setting listZonesError causes p.Zones() to fail inside submitChanges,
+		// exercising the `if err != nil { return err }` block at the top of the loop.
+		client := NewMockCloudFlareClient()
+		client.listZonesError = errors.New("zones fetch failed")
+		p := &CloudFlareProvider{Client: client}
+
+		changes := &plan.Changes{
+			Create: []*endpoint.Endpoint{
+				{DNSName: "test.bar.com", Targets: endpoint.Targets{"1.2.3.4"}, RecordType: "A"},
+			},
+		}
+		err := p.ApplyChanges(t.Context(), changes)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "zones fetch failed")
+	})
+}
+
+func TestParseTagsAnnotation(t *testing.T) {
+	t.Run("parses comma-separated tags", func(t *testing.T) {
+		tags := parseTagsAnnotation("tag1,tag2,tag3")
+		assert.Equal(t, []string{"tag1", "tag2", "tag3"}, tags)
+	})
+	t.Run("trims whitespace from each tag", func(t *testing.T) {
+		tags := parseTagsAnnotation("  z-tag ,  a-tag  ")
+		assert.Equal(t, []string{"a-tag", "z-tag"}, tags)
+	})
+	t.Run("sorts tags canonically", func(t *testing.T) {
+		tags := parseTagsAnnotation("c,a,b")
+		assert.Equal(t, []string{"a", "b", "c"}, tags)
+	})
+	t.Run("skips empty tokens", func(t *testing.T) {
+		tags := parseTagsAnnotation("tag1,,,, tag2")
+		assert.Equal(t, []string{"tag1", "tag2"}, tags)
+	})
+}
+
+func TestAdjustEndpoints_TagsAnnotation(t *testing.T) {
+	// parseTagsAnnotation is only invoked when the CloudflareTagsKey annotation
+	// is present on the endpoint. This test exercises that branch via AdjustEndpoints.
+	p := &CloudFlareProvider{}
+	ep := &endpoint.Endpoint{
+		RecordType: "A",
+		DNSName:    "test.bar.com",
+		Targets:    endpoint.Targets{"1.2.3.4"},
+		ProviderSpecific: endpoint.ProviderSpecific{
+			{
+				Name:  annotations.CloudflareTagsKey,
+				Value: "beta, alpha, gamma",
+			},
+		},
+	}
+	adjusted, err := p.AdjustEndpoints([]*endpoint.Endpoint{ep})
+	require.NoError(t, err)
+	require.Len(t, adjusted, 1)
+
+	val, ok := adjusted[0].GetProviderSpecificProperty(annotations.CloudflareTagsKey)
+	require.True(t, ok, "tags annotation should still be present after AdjustEndpoints")
+	// Tags should be sorted and whitespace-trimmed
+	assert.Equal(t, "alpha,beta,gamma", val)
+}
+
+func TestZoneServiceZoneIDByName(t *testing.T) {
+	// Build a minimal cloudflare API response page for /zones.
+	writeZonesPage := func(w http.ResponseWriter, zones []map[string]any) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"result": zones,
+			"result_info": map[string]any{
+				"count":       len(zones),
+				"total_count": len(zones),
+				"page":        1,
+				"per_page":    20,
+			},
+			"success":  true,
+			"errors":   []any{},
+			"messages": []any{},
+		}); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}
+
+	t.Run("zone found returns its ID", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeZonesPage(w, []map[string]any{
+				{"id": "zone-abc", "name": "example.com", "plan": map[string]any{"is_subscribed": false}},
+			})
+		}))
+		defer ts.Close()
+
+		svc := &zoneService{service: cloudflare.NewClient(
+			option.WithBaseURL(ts.URL+"/"),
+			option.WithAPIToken("test-token"),
+			option.WithMaxRetries(0),
+		)}
+		id, err := svc.ZoneIDByName("example.com")
+		require.NoError(t, err)
+		assert.Equal(t, "zone-abc", id)
+	})
+
+	t.Run("zone not found returns descriptive error", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeZonesPage(w, []map[string]any{})
+		}))
+		defer ts.Close()
+
+		svc := &zoneService{service: cloudflare.NewClient(
+			option.WithBaseURL(ts.URL+"/"),
+			option.WithAPIToken("test-token"),
+			option.WithMaxRetries(0),
+		)}
+		id, err := svc.ZoneIDByName("missing.com")
+		assert.Empty(t, id)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not found in CloudFlare account")
+	})
+
+	t.Run("server error causes wrapped iterator error", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"result":   nil,
+				"success":  false,
+				"errors":   []map[string]any{{"code": 500, "message": "internal server error"}},
+				"messages": []any{},
+			})
+		}))
+		defer ts.Close()
+
+		svc := &zoneService{service: cloudflare.NewClient(
+			option.WithBaseURL(ts.URL+"/"),
+			option.WithAPIToken("test-token"),
+			option.WithMaxRetries(0),
+		)}
+		id, err := svc.ZoneIDByName("any.com")
+		assert.Empty(t, id)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to list zones from CloudFlare API")
+	})
 }

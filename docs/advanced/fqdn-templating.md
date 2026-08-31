@@ -1,3 +1,7 @@
+---
+tags: ["advanced", "area/fqdn", "fqdn", "templating"]
+---
+
 # FQDN Templating Guide
 
 ## What is FQDN Templating?
@@ -19,15 +23,30 @@ ExternalDNS has a flag: `--fqdn-template`, which defines a Go template for rende
 
 The template uses the following data from the source object (e.g., a `Service` or `Ingress`):
 
-| Field         | Description                                                       |
-|:--------------|:------------------------------------------------------------------|
-| `Name`        | Name of the object (e.g., service)                                |
-| `Namespace`   | Namespace of the object                                           |
-| `Labels`      | Map of labels applied to the object                               |
-| `Annotations` | Map of annotations                                                |
-| `TargetName`  | For `Service`, it's the service name; for `Ingress`, the hostname |
-| `Endpoint`    | Contains more contextual endpoint info, such as IP/target         |
-| `Controller`  | Controller type (optional)                                        |
+| Field         | Description                                      | How to Access                                          |
+|:--------------|:-------------------------------------------------|:-------------------------------------------------------|
+| `Kind`        | Object kind (e.g., `Service`, `Pod`, `Ingress`)  | `{{ .Kind }}`                                          |
+| `APIVersion`  | API version (e.g., `v1`, `networking.k8s.io/v1`) | `{{ .APIVersion }}`                                    |
+| `Name`        | Name of the object (e.g., service)               | `{{ .Name }}`                                          |
+| `Namespace`   | Namespace of the object                          | `{{ .Namespace }}`                                     |
+| `Labels`      | Map of labels applied to the object              | `{{ .Labels.key }}` or `{{ index .Labels "key" }}`     |
+| `Annotations` | Map of annotations                               | `{{ index .Annotations "key" }}`                       |
+| `Spec`        | Object spec with type-specific fields            | `{{ .Spec.Type }}`, `{{ index .Spec.Selector "app" }}` |
+| `Status`      | Object status with type-specific fields          | `{{ .Status.LoadBalancer.Ingress }}`                   |
+
+To explore all available fields for an object type, use `kubectl explain`:
+
+```bash
+# View all fields for a Service recursively.
+kubectl explain service --api-version=v1 --recursive
+
+# View all fields for a Ingress recursively.
+kubectl explain ingress --api-version=networking.k8s.io/v1 --recursive
+
+# View a specific field path. The dot notation is for field path.
+kubectl explain service.spec.selector
+kubectl explain pod.spec.containers
+```
 
 ## Supported Sources
 
@@ -35,30 +54,30 @@ The template uses the following data from the source object (e.g., a `Service` o
 
 | Source                 | Description                                                     | FQDN Supported | FQDN Combine |
 |:-----------------------|:----------------------------------------------------------------|:--------------:|:------------:|
-| `ambassador-host`      | Queries Ambassador Host resources for endpoints.                |       ❌        |      ❌       |
-| `connector`            | Queries a custom connector source for endpoints.                |       ❌        |      ❌       |
-| `contour-httpproxy`    | Queries Contour HTTPProxy resources for endpoints.              |       ✅        |      ✅       |
-| `crd`                  | Queries Custom Resource Definitions (CRDs) for endpoints.       |       ❌        |      ❌       |
-| `empty`                | Uses an empty source, typically for testing or no-op scenarios. |       ❌        |      ❌       |
-| `f5-transportserver`   | Queries F5 TransportServer resources for endpoints.             |       ❌        |      ❌       |
-| `f5-virtualserver`     | Queries F5 VirtualServer resources for endpoints.               |       ❌        |      ❌       |
-| `fake`                 | Uses a fake source for testing purposes.                        |       ❌        |      ❌       |
-| `gateway-grpcroute`    | Queries GRPCRoute resources from the Gateway API.               |       ✅        |      ❌       |
-| `gateway-httproute`    | Queries HTTPRoute resources from the Gateway API.               |       ✅        |      ❌       |
-| `gateway-tcproute`     | Queries TCPRoute resources from the Gateway API.                |       ✅        |      ❌       |
-| `gateway-tlsroute`     | Queries TLSRoute resources from the Gateway API.                |       ❌        |      ❌       |
-| `gateway-udproute`     | Queries UDPRoute resources from the Gateway API.                |       ❌        |      ❌       |
-| `gloo-proxy`           | Queries Gloo Proxy resources for endpoints.                     |       ❌        |      ❌       |
-| `ingress`              | Queries Kubernetes Ingress resources for endpoints.             |       ✅        |      ✅       |
-| `istio-gateway`        | Queries Istio Gateway resources for endpoints.                  |       ✅        |      ✅       |
-| `istio-virtualservice` | Queries Istio VirtualService resources for endpoints.           |       ✅        |      ✅       |
-| `kong-tcpingress`      | Queries Kong TCPIngress resources for endpoints.                |       ❌        |      ❌       |
-| `node`                 | Queries Kubernetes Node resources for endpoints.                |       ✅        |      ✅       |
-| `openshift-route`      | Queries OpenShift Route resources for endpoints.                |       ✅        |      ✅       |
-| `pod`                  | Queries Kubernetes Pod resources for endpoints.                 |       ✅        |      ✅       |
-| `service`              | Queries Kubernetes Service resources for endpoints.             |       ✅        |      ✅       |
-| `skipper-routegroup`   | Queries Skipper RouteGroup resources for endpoints.             |       ✅        |      ✅       |
-| `traefik-proxy`        | Queries Traefik IngressRoute resources for endpoints.                  |       ❌        |      ❌       |
+| `ambassador-host`      | Queries Ambassador Host resources for endpoints.                |       No       |      No      |
+| `connector`            | Queries a custom connector source for endpoints.                |       No       |      No      |
+| `contour-httpproxy`    | Queries Contour HTTPProxy resources for endpoints.              |      Yes       |     Yes      |
+| `crd`                  | Queries Custom Resource Definitions (CRDs) for endpoints.       |       No       |      No      |
+| `empty`                | Uses an empty source, typically for testing or no-op scenarios. |       No       |      No      |
+| `f5-transportserver`   | Queries F5 TransportServer resources for endpoints.             |       No       |      No      |
+| `f5-virtualserver`     | Queries F5 VirtualServer resources for endpoints.               |       No       |      No      |
+| `fake`                 | Uses a fake source for testing purposes.                        |       No       |      No      |
+| `gateway-grpcroute`    | Queries GRPCRoute resources from the Gateway API.               |      Yes       |      No      |
+| `gateway-httproute`    | Queries HTTPRoute resources from the Gateway API.               |      Yes       |      No      |
+| `gateway-tcproute`     | Queries TCPRoute resources from the Gateway API.                |      Yes       |      No      |
+| `gateway-tlsroute`     | Queries TLSRoute resources from the Gateway API.                |       No       |      No      |
+| `gateway-udproute`     | Queries UDPRoute resources from the Gateway API.                |       No       |      No      |
+| `gloo-proxy`           | Queries Gloo Proxy resources for endpoints.                     |       No       |      No      |
+| `ingress`              | Queries Kubernetes Ingress resources for endpoints.             |      Yes       |     Yes      |
+| `istio-gateway`        | Queries Istio Gateway resources for endpoints.                  |      Yes       |     Yes      |
+| `istio-virtualservice` | Queries Istio VirtualService resources for endpoints.           |      Yes       |     Yes      |
+| `kong-tcpingress`      | Queries Kong TCPIngress resources for endpoints.                |       No       |      No      |
+| `node`                 | Queries Kubernetes Node resources for endpoints.                |      Yes       |     Yes      |
+| `openshift-route`      | Queries OpenShift Route resources for endpoints.                |      Yes       |     Yes      |
+| `pod`                  | Queries Kubernetes Pod resources for endpoints.                 |      Yes       |     Yes      |
+| `service`              | Queries Kubernetes Service resources for endpoints.             |      Yes       |     Yes      |
+| `skipper-routegroup`   | Queries Skipper RouteGroup resources for endpoints.             |      Yes       |     Yes      |
+| `traefik-proxy`        | Queries Traefik IngressRoute resources for endpoints.           |       No       |      No      |
 
 ## Custom Functions
 
@@ -69,11 +88,14 @@ The template uses the following data from the source object (e.g., a `Service` o
 | `contains`   | Check if `substr` is in `string`                      | `{{ contains "hello" "ell" }} → true`                                              |
 | `isIPv4`     | Validate an IPv4 address                              | `{{ isIPv4 "192.168.1.1" }} → true`                                                |
 | `isIPv6`     | Validate an IPv6 address (including IPv4-mapped IPv6) | `{{ isIPv6 "2001:db8::1" }} → true`<br/>`{{ isIPv6 "::FFFF:192.168.1.1" }} → true` |
+| `isSource`   | Check the ExternalDNS source name (case-insensitive)  | `{{ if isSource "traefik-proxy" }}...{{ end }}`                                    |
 | `replace`    | Replace `old` with `new`                              | `{{ replace "l" "w" "hello" }} → hewwo`                                            |
 | `trim`       | Remove leading and trailing spaces                    | `{{ trim "  hello  " }} → hello`                                                   |
 | `toLower`    | Convert to lowercase                                  | `{{ toLower "HELLO" }} → hello`                                                    |
 | `trimPrefix` | Remove the leading `prefix`                           | `{{ trimPrefix "hello" "h" }} → ello`                                              |
 | `trimSuffix` | Remove the trailing `suffix`                          | `{{ trimSuffix "hello" "o" }} → hell`                                              |
+| `hasKey`     | Check if a key exists in a map                        | `{{ hasKey .Labels "app" }} → true`                                                |
+| `fromJson`   | Parse a JSON string into a value                      | `{{ index (fromJson "{\"env\":\"prod\"}") "env" }} → prod`                         |
 
 ---
 
@@ -93,14 +115,22 @@ metadata:
 ```
 
 ```sh
+# Single template
 external-dns \
   --provider=aws \
   --source=service \
-  --fqdn-template="{{ .Name }}.example.com,{{ .Name }}.{{ .Namespace }}.example.tld"
+  --fqdn-template="{{ .Name }}.example.com"
+
+# Multiple templates — specify the flag more than once
+external-dns \
+  --provider=aws \
+  --source=service \
+  --fqdn-template="{{ .Name }}.example.com" \
+  --fqdn-template="{{ .Name }}.{{ .Namespace }}.example.tld"
 
 # This will result in DNS entries like
->route53> my-service.example.com
->route53> my-service.my-namespace.example.tld
+# route53> my-service.example.com
+# route53> my-service.my-namespace.example.tld
 ```
 
 ### With Namespace
@@ -156,10 +186,15 @@ ExternalDNS allows specifying multiple FQDN templates, which can be useful when 
 
 > Be cautious, as this will create multiple DNS records per resource, potentially increasing the number of API calls to your DNS provider.
 
+Specify `--fqdn-template` multiple times — one flag per template:
+
 ```yml
 args:
-  --fqdn-template={{.Name}}.example.com,{{.Name}}.svc.example.com
+  - --fqdn-template={{.Name}}.example.com
+  - --fqdn-template={{.Name}}.svc.example.com
 ```
+
+Duplicate templates and leading/trailing whitespace are ignored automatically.
 
 ### Conditional Templating combined with Annotations processing
 
@@ -213,19 +248,198 @@ args:
 
 This helps automate DNS record migration while maintaining service continuity.
 
+### Using Kind for Conditional Templating
+
+When processing multiple resource types, use `.Kind` to apply templates conditionally:
+
+```yml
+args:
+  --fqdn-template='{{ if eq .Kind "Service" }}{{ .Name }}.svc.example.com{{ end }}'
+
+# Only Services will get DNS entries, Pods and other resources will be skipped
+```
+
+You can also handle multiple kinds in one template:
+
+```yml
+args:
+  --fqdn-template='{{ if eq .Kind "Service" }}{{ .Name }}.svc.example.com{{ end }}{{ if eq .Kind "Pod" }}{{ .Name }}.pod.example.com{{ end }}'
+```
+
+### Using `isSource` for Conditional Templating by Source
+
+`isSource` checks which ExternalDNS **source** (the `--source` flag value, e.g. `service`, `ingress`, `traefik-proxy`) produced the object, not its Kubernetes `Kind`.
+
+This matters because `Kind` and source don't always map one-to-one: `traefik-proxy` alone produces `IngressRoute`, `IngressRouteTCP`, and `IngressRouteUDP` objects, and `unstructured` can produce arbitrary CRD kinds.
+
+`isSource` lets a single `--fqdn-template` (applied across all configured sources) target one source regardless of which kind(s) it emits:
+
+```yml
+args:
+  --source=service
+  --source=traefik-proxy
+  --fqdn-template='{{ if isSource "traefik-proxy" }}{{ .Name }}.proxy.example.com{{ end }}{{ if isSource "service" }}{{ .Name }}.svc.example.com{{ end }}'
+
+# Only objects from the traefik-proxy source get a .proxy.example.com record,
+# regardless of whether they're IngressRoute, IngressRouteTCP, or IngressRouteUDP.
+```
+
+The match is case-insensitive.
+
+### Using Spec Fields
+
+Access type-specific spec fields for advanced filtering:
+
+```yml
+# Only ExternalName services
+args:
+  --fqdn-template='{{ if eq .Kind "Service" }}{{ if eq .Spec.Type "ExternalName" }}{{ .Name }}.external.example.com{{ end }}{{ end }}'
+```
+
+```yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-frontend
+spec:
+  selector:
+    app: nginx        # This selector will be used in the FQDN
+    tier: frontend
+  ports:
+    - port: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+spec:
+  selector:
+    tier: backend     # Won't generate FQDN - no "app" key in selector
+  ports:
+    - port: 5432
+```
+
+```yml
+# Services with specific selector
+args:
+  --fqdn-template='{{ if eq .Kind "Service" }}{{ if index .Spec.Selector "app" }}{{ .Name }}.{{ index .Spec.Selector "app" }}.example.com{{ end }}{{ end }}'
+
+# Result for web-frontend: web-frontend.nginx.example.com
+# Result for database: (no FQDN generated - selector has no "app" key)
+```
+
+### Iterating Over Labels with Range
+
+Use `range` to iterate over labels and generate multiple FQDNs:
+
+```yml
+args:
+  --fqdn-template='{{ if eq .Kind "Service" }}{{ range $key, $value := .Labels }}{{ if contains $key "app" }}{{ $.Name }}.{{ $value }}.example.com{{ printf "," }}{{ end }}{{ end }}{{ end }}'
+```
+
+This generates an FQDN for each label key containing "app". Note:
+
+- `$key` and `$value` are the label key/value pairs
+- `$.Name` accesses the root object's Name (use `$` inside `range`)
+- `{{ printf "," }}` separates multiple FQDNs
+
+### Working with Annotations
+
+Access a specific annotation:
+
+```yml
+args:
+  --fqdn-template='{{ index .Annotations "dns.example.com/hostname" }}.example.com'
+```
+
+Iterate over annotations and filter by key:
+
+```yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  annotations:
+    dns.example.com/primary: api.example.com
+    dns.example.com/secondary: api-backup.example.com
+    kubernetes.io/ingress-class: nginx  # Won't match - key doesn't contain "dns.example.com/"
+```
+
+```yml
+args:
+  --fqdn-template='{{ range $key, $value := .Annotations }}{{ if contains $key "dns.example.com/" }}{{ $value }}{{ printf "," }}{{ end }}{{ end }}'
+
+# Captures all annotations with keys containing "dns.example.com/"
+# Result: api.example.com, api-backup.example.com
+```
+
+Filter annotations by value:
+
+```yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  annotations:
+    custom/hostname: api.example.com
+    custom/alias: www.example.com
+    custom/internal: internal.local  # Won't match - value doesn't contain ".example.com"
+```
+
+```yml
+args:
+  --fqdn-template='{{ range $key, $value := .Annotations }}{{ if contains $value ".example.com" }}{{ $value }}{{ printf "," }}{{ end }}{{ end }}'
+
+# Captures all annotation values containing ".example.com"
+# Result: api.example.com, www.example.com
+```
+
+Combine annotation key and value filters:
+
+```yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  annotations:
+    dns/primary: api.example.com
+    dns/secondary: api-backup.example.com
+    other/hostname: internal.other.org  # Won't match - value doesn't contain "example.com"
+    logging/level: debug                # Won't match - key doesn't contain "dns/"
+```
+
+```yml
+args:
+  --fqdn-template='{{ if eq .Kind "Service" }}{{ range $k, $v := .Annotations }}{{ if and (contains $k "dns/") (contains $v "example.com") }}{{ $v }}{{ printf "," }}{{ end }}{{ end }}{{ end }}'
+
+# Result: api.example.com, api-backup.example.com
+```
+
+### Combining Kind and Label Filters
+
+Filter by both Kind and label values:
+
+```yml
+args:
+  --fqdn-template='{{ if eq .Kind "Pod" }}{{ range $k, $v := .Labels }}{{ if and (contains $k "app") (contains $v "my-service-") }}{{ $.Name }}.{{ $v }}.example.com{{ printf "," }}{{ end }}{{ end }}{{ end }}'
+
+# Generates FQDNs only for Pods with labels like app1=my-service-123
+# Result: pod-name.my-service-123.example.com
+```
+
 ### Multi-Variant Domain Support
 
 You can also support regional variants or multi-tenant architectures, where the same service is deployed to different regions or environments:
 
 ```yaml
 --fqdn-template='{{ .Name }}.{{ .Labels.env }}.{{ .Labels.region }}.example.com, {{ if eq .Labels.env "prod" }}{{ .Name }}.my-company.tld{{ end }}'
-```
 
-With additional context (e.g., annotations), this can produce FQDNs like:
+# Generates FQDNs for resources with labels env and region
+# For a Service named "api" with labels env=prod, region=us-east-1:
+# Result: api.prod.us-east-1.example.com, api.my-company.tld
 
-```yml
-api.prod.us-east-1.example.com
-api.my-company.tld
+# For a Service named "api" with labels env=staging, region=eu-west-1:
+# Result: api.staging.eu-west-1.example.com
 ```
 
 This is helpful in scenarios such as:
@@ -236,7 +450,7 @@ This is helpful in scenarios such as:
 
 ## Tips
 
-- If `--fqdn-template` is specified, ExternalDNS ignores any `external-dns.alpha.kubernetes.io/hostname` annotations.
+- If `--fqdn-template` is specified, ExternalDNS ignores any `external-dns.kubernetes.io/hostname` annotations (unless `--combine-fqdn-annotation` is also set).
 - You must still ensure the resulting FQDN is valid and unique.
 - Since Go templates can be error-prone, test your template with simple examples before deploying. Mismatched field names or nil values (e.g., missing labels) will result in errors or skipped entries.
 
@@ -244,11 +458,19 @@ This is helpful in scenarios such as:
 
 ### Can I specify multiple global FQDN templates?
 
-Yes, you can. Pass in a comma separated list to --fqdn-template. Beware this will double (triple, etc) the amount of DNS entries based on how many services, ingresses and so on you have and will get you faster towards the API request limit of your DNS provider.
+Yes. Specify `--fqdn-template` more than once — one flag per template:
+
+```sh
+external-dns \
+  --fqdn-template="{{ .Name }}.example.com" \
+  --fqdn-template="{{ .Name }}.svc.example.com"
+```
+
+Beware: this will double (triple, etc.) the number of DNS entries based on how many services, ingresses, and so on you have, and will bring you faster towards the API request limit of your DNS provider. Duplicate templates are deduplicated automatically.
 
 ### Where to find template syntax
 
-- [Go template syntax](https://pkg.go.dev/text/template)
+- [Go template syntax](https://pkg.go.dev/text/template) - Official reference for template syntax, actions, and pipelines
 - [Go func builtins](https://github.com/golang/go/blob/master/src/text/template/funcs.go#L39-L63)
 
 ### FQDN Templating, Helm and improper templating syntax
@@ -318,4 +540,59 @@ args:
   - --fqdn-template="{{range .Status.Addresses}}{{if and (eq .Type \"ExternalIP\") (isIPv4 .Address)}}{{.Address | replace \".\" \"-\"}}{{break}}{{end}}{{end}}.example.com"
 ```
 
-This is a complex template that iternates through a list of a Node's Addresses and creates a FQDN with public IPv4 addresses.
+This is a complex template that iterates through a list of a Node's Addresses and creates a FQDN with public IPv4 addresses.
+
+### Using `hasKey` for Safe Label and Annotation Access
+
+Unlike `index`, which returns an empty string for both a missing key and a key with an empty value, `hasKey` explicitly checks for key existence. This matters for Kubernetes marker labels (e.g., `service.kubernetes.io/headless: ""`), where an empty value is meaningful.
+
+Check for a label before using it in a template:
+
+```yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  labels:
+    app: nginx
+```
+
+```yml
+args:
+  - --fqdn-template={{ if hasKey .Labels "app" }}{{ .Name }}.{{ index .Labels "app" }}.example.com{{ end }}
+
+# Result: my-service.nginx.example.com
+```
+
+This only generates an FQDN when the `app` label is present. Without `hasKey`, `{{ index .Labels "app" }}` would silently return `""` for unlabelled resources, producing an invalid FQDN like `my-service..example.com`.
+
+Combine with `Kind` for targeted rules:
+
+```yml
+args:
+  - --fqdn-template={{ if and (eq .Kind "Service") (hasKey .Labels "tier") }}{{ .Name }}.{{ index .Labels "tier" }}.example.com{{ end }}
+```
+
+### Using `fromJson` to Parse Structured Labels
+
+`fromJson` parses a JSON string stored in a label or annotation into a Go value, enabling templates to iterate over structured data.
+
+Given a Service with a JSON array of DNS entries in a label:
+
+```yml
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-service
+  labels:
+    records: '[{"dns":"entry1.internal.tld","target":"10.10.10.10"},{"dns":"entry2.example.tld","target":"my.cluster.local"}]'
+```
+
+Use `hasKey` to guard against a missing label, then iterate with `range` to emit one FQDN per entry:
+
+```yml
+args:
+  - --fqdn-template={{ if hasKey .Labels "records" }}{{ range $entry := (index .Labels "records" | fromJson) }}{{ index $entry "dns" }},{{ end }}{{ end }}
+
+# Result: entry1.internal.tld, entry2.example.tld
+```

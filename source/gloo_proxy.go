@@ -24,10 +24,11 @@ import (
 	"strings"
 
 	log "github.com/sirupsen/logrus"
-	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	networkv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -38,8 +39,12 @@ import (
 	netinformers "k8s.io/client-go/informers/networking/v1"
 
 	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/internal/sets"
+	"sigs.k8s.io/external-dns/pkg/events"
 	"sigs.k8s.io/external-dns/source/annotations"
 	"sigs.k8s.io/external-dns/source/informers"
+	"sigs.k8s.io/external-dns/source/template"
+	"sigs.k8s.io/external-dns/source/types"
 )
 
 var (
@@ -62,9 +67,14 @@ var (
 
 // Basic redefinition of "Proxy" CRD : https://github.com/solo-io/gloo/blob/v1.4.6/projects/gloo/pkg/api/v1/proxy.pb.go
 type proxy struct {
-	metav1.TypeMeta `json:",inline"`
-	Metadata        metav1.ObjectMeta `json:"metadata"`
-	Spec            proxySpec         `json:"spec"`
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata"`
+	Spec              proxySpec `json:"spec"`
+}
+
+func (p *proxy) DeepCopyObject() runtime.Object {
+	cp := *p
+	return &cp
 }
 
 type proxySpec struct {
@@ -72,8 +82,25 @@ type proxySpec struct {
 }
 
 type proxySpecListener struct {
-	HTTPListener   proxySpecHTTPListener `json:"httpListener"`
-	MetadataStatic proxyMetadataStatic   `json:"metadataStatic"`
+	HTTPListener      proxySpecHTTPListener      `json:"httpListener"`
+	AggregateListener proxySpecAggregateListener `json:"aggregateListener"`
+	MetadataStatic    proxyMetadataStatic        `json:"metadataStatic"`
+}
+
+// proxySpecAggregateListener is used instead of HTTPListener when a Gateway
+// has isolateVirtualHostsBySslConfig enabled, which splits virtual hosts
+// into per-SSL-config filter chains that reference shared virtual hosts by name.
+type proxySpecAggregateListener struct {
+	HTTPFilterChains []proxyAggregateListenerHTTPFilterChain `json:"httpFilterChains,omitempty"`
+	HTTPResources    proxyAggregateListenerHTTPResources     `json:"httpResources"`
+}
+
+type proxyAggregateListenerHTTPFilterChain struct {
+	VirtualHostRefs []string `json:"virtualHostRefs,omitempty"`
+}
+
+type proxyAggregateListenerHTTPResources struct {
+	VirtualHosts map[string]proxyVirtualHost `json:"virtualHosts,omitempty"`
 }
 
 type proxyMetadataStatic struct {
@@ -131,27 +158,41 @@ type proxyVirtualHostMetadataSourceResourceRef struct {
 // +externaldns:source:category=Service Mesh
 // +externaldns:source:description=Creates DNS entries from Gloo Proxy resources
 // +externaldns:source:resources=Proxy.gloo.solo.io
-// +externaldns:source:filters=
+// +externaldns:source:filters=annotation,label
 // +externaldns:source:namespace=all,single
-// +externaldns:source:fqdn-template=false
+// +externaldns:source:fqdn-template=true
+// +externaldns:source:provider-specific=true
 type glooSource struct {
 	serviceInformer        coreinformers.ServiceInformer
 	ingressInformer        netinformers.IngressInformer
 	proxyInformer          kubeinformers.GenericInformer
 	virtualServiceInformer kubeinformers.GenericInformer
 	gatewayInformer        kubeinformers.GenericInformer
-	glooNamespaces         []string
+	templateEngine         template.Engine
 }
 
 // NewGlooSource creates a new glooSource with the given config
-func NewGlooSource(ctx context.Context, dynamicKubeClient dynamic.Interface, kubeClient kubernetes.Interface,
-	glooNamespaces []string) (Source, error) {
+func NewGlooSource(
+	ctx context.Context,
+	dynamicKubeClient dynamic.Interface,
+	kubeClient kubernetes.Interface,
+	cfg *Config) (Source, error) {
 	informerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, 0)
 	serviceInformer := informerFactory.Core().V1().Services()
 	ingressInformer := informerFactory.Networking().V1().Ingresses()
 
-	_, _ = serviceInformer.Informer().AddEventHandler(informers.DefaultEventHandler())
-	_, _ = ingressInformer.Informer().AddEventHandler(informers.DefaultEventHandler())
+	informers.MustSetTransform(serviceInformer.Informer(), informers.TransformerWithOptions[*v1.Service](
+		informers.TransformRemoveManagedFields(),
+		informers.TransformRemoveLastAppliedConfig(),
+		informers.TransformRemoveStatusConditions(),
+	))
+	informers.MustSetTransform(ingressInformer.Informer(), informers.TransformerWithOptions[*networkv1.Ingress](
+		informers.TransformRemoveManagedFields(),
+		informers.TransformRemoveLastAppliedConfig(),
+	))
+
+	informers.MustAddEventHandler(serviceInformer.Informer(), informers.DefaultEventHandler())
+	informers.MustAddEventHandler(ingressInformer.Informer(), informers.DefaultEventHandler())
 
 	dynamicInformerFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynamicKubeClient, 0)
 
@@ -159,9 +200,23 @@ func NewGlooSource(ctx context.Context, dynamicKubeClient dynamic.Interface, kub
 	virtualServiceInformer := dynamicInformerFactory.ForResource(virtualServiceGVR)
 	gatewayInformer := dynamicInformerFactory.ForResource(gatewayGVR)
 
-	_, _ = proxyInformer.Informer().AddEventHandler(informers.DefaultEventHandler())
-	_, _ = virtualServiceInformer.Informer().AddEventHandler(informers.DefaultEventHandler())
-	_, _ = gatewayInformer.Informer().AddEventHandler(informers.DefaultEventHandler())
+	unstructuredTransformer := informers.TransformerWithOptions[*unstructured.Unstructured](
+		informers.TransformRemoveManagedFields(),
+		informers.TransformRemoveLastAppliedConfig(),
+	)
+	for _, inf := range []kubeinformers.GenericInformer{proxyInformer, virtualServiceInformer, gatewayInformer} {
+		informers.MustSetTransform(inf.Informer(), unstructuredTransformer)
+		informers.MustAddEventHandler(inf.Informer(), informers.DefaultEventHandler())
+	}
+	allowedNS := sets.New(cfg.GlooNamespaces...)
+	informers.MustAddIndexers(proxyInformer.Informer(), informers.IndexerWithOptions[*unstructured.Unstructured](
+		informers.IndexSelectorWithAnnotationFilter(cfg.AnnotationFilter),
+		informers.IndexSelectorWithLabelSelector(cfg.LabelFilter),
+		informers.IndexSelectorWithConditions(
+			annotations.IsControllerMatch[*unstructured.Unstructured],
+			func(u *unstructured.Unstructured) bool { return allowedNS.Has(u.GetNamespace()) },
+		),
+	))
 
 	informerFactory.Start(ctx.Done())
 	dynamicInformerFactory.Start(ctx.Done())
@@ -173,79 +228,79 @@ func NewGlooSource(ctx context.Context, dynamicKubeClient dynamic.Interface, kub
 	}
 
 	return &glooSource{
-		serviceInformer,
-		ingressInformer,
-		proxyInformer,
-		virtualServiceInformer,
-		gatewayInformer,
-		glooNamespaces,
+		serviceInformer:        serviceInformer,
+		ingressInformer:        ingressInformer,
+		proxyInformer:          proxyInformer,
+		virtualServiceInformer: virtualServiceInformer,
+		gatewayInformer:        gatewayInformer,
+		templateEngine:         cfg.TemplateEngine,
 	}, nil
 }
 
-func (gs *glooSource) AddEventHandler(_ context.Context, _ func()) {
+func (gs *glooSource) AddEventHandler(_ context.Context, handler func()) {
+	informers.MustAddEventHandler(gs.proxyInformer.Informer(), eventHandlerFunc(handler))
 }
 
 // Endpoints returns endpoint objects
 func (gs *glooSource) Endpoints(_ context.Context) ([]*endpoint.Endpoint, error) {
 	endpoints := []*endpoint.Endpoint{}
 
-	for _, ns := range gs.glooNamespaces {
-		proxyObjects, err := gs.proxyInformer.Lister().ByNamespace(ns).List(labels.Everything())
+	for _, unstructuredObj := range informers.ListIndexed[*unstructured.Unstructured](gs.proxyInformer.Informer().GetIndexer()) {
+		jsonData, err := json.Marshal(unstructuredObj.Object)
 		if err != nil {
 			return nil, err
 		}
 
-		for _, obj := range proxyObjects {
-			unstructuredObj, ok := obj.(*unstructured.Unstructured)
-			if !ok {
-				return nil, err
-			}
-
-			jsonData, err := json.Marshal(unstructuredObj.Object)
-			if err != nil {
-				return nil, err
-			}
-
-			var proxy proxy
-			if err = json.Unmarshal(jsonData, &proxy); err != nil {
-				return nil, err
-			}
-			log.Debugf("Gloo: Find %s proxy", proxy.Metadata.Name)
-
-			proxyTargets := annotations.TargetsFromTargetAnnotation(proxy.Metadata.Annotations)
-			if len(proxyTargets) == 0 {
-				proxyTargets, err = gs.targetsFromGatewayIngress(&proxy)
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			if len(proxyTargets) == 0 {
-				proxyTargets, err = gs.proxyTargets(proxy.Metadata.Name, ns)
-				if err != nil {
-					return nil, err
-				}
-			}
-			log.Debugf("Gloo[%s]: Find %d target(s) (%+v)", proxy.Metadata.Name, len(proxyTargets), proxyTargets)
-
-			proxyEndpoints, err := gs.generateEndpointsFromProxy(&proxy, proxyTargets)
-			if err != nil {
-				return nil, err
-			}
-			log.Debugf("Gloo[%s]: Generate %d endpoint(s)", proxy.Metadata.Name, len(proxyEndpoints))
-			endpoints = append(endpoints, proxyEndpoints...)
+		var proxy proxy
+		if err = json.Unmarshal(jsonData, &proxy); err != nil {
+			return nil, err
 		}
+		log.Debugf("Gloo: Find %s proxy", proxy.Name)
+
+		proxyTargets := annotations.TargetsFromTargetAnnotation(proxy.Annotations)
+		if len(proxyTargets) == 0 {
+			proxyTargets, err = gs.targetsFromGatewayIngress(&proxy)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if len(proxyTargets) == 0 {
+			proxyTargets, err = gs.proxyTargets(proxy.Name, unstructuredObj.GetNamespace())
+			if err != nil {
+				return nil, err
+			}
+		}
+		log.Debugf("Gloo[%s]: Find %d target(s) (%+v)", proxy.Name, len(proxyTargets), proxyTargets)
+
+		proxyEndpoints, err := gs.generateEndpointsFromProxy(&proxy, proxyTargets)
+		if err != nil {
+			return nil, err
+		}
+		log.Debugf("Gloo[%s]: Generate %d endpoint(s)", proxy.Name, len(proxyEndpoints))
+
+		endpoint.AttachRefObject(proxyEndpoints, events.NewObjectReference(unstructuredObj, types.GlooProxy))
+
+		endpoints = append(endpoints, proxyEndpoints...)
 	}
-	return endpoints, nil
+	return endpoint.MergeEndpoints(endpoints), nil
 }
 
-func (gs *glooSource) generateEndpointsFromProxy(proxy *proxy, targets endpoint.Targets) ([]*endpoint.Endpoint, error) {
-	endpoints := []*endpoint.Endpoint{}
+func (gs *glooSource) generateEndpointsFromProxy(p *proxy, targets endpoint.Targets) ([]*endpoint.Endpoint, error) {
+	var endpoints []*endpoint.Endpoint
 
-	resource := fmt.Sprintf("proxy/%s/%s", proxy.Metadata.Namespace, proxy.Metadata.Name)
+	resource := fmt.Sprintf("proxy/%s/%s", p.Namespace, p.Name)
 
-	for _, listener := range proxy.Spec.Listeners {
-		for _, virtualHost := range listener.HTTPListener.VirtualHosts {
+	for _, listener := range p.Spec.Listeners {
+		virtualHosts := listener.HTTPListener.VirtualHosts
+		for _, chain := range listener.AggregateListener.HTTPFilterChains {
+			for _, ref := range chain.VirtualHostRefs {
+				if virtualHost, ok := listener.AggregateListener.HTTPResources.VirtualHosts[ref]; ok {
+					virtualHosts = append(virtualHosts, virtualHost)
+				}
+			}
+		}
+		for _, virtualHost := range virtualHosts {
 			ants, err := gs.annotationsFromProxySource(virtualHost)
 			if err != nil {
 				return nil, err
@@ -253,11 +308,12 @@ func (gs *glooSource) generateEndpointsFromProxy(proxy *proxy, targets endpoint.
 			ttl := annotations.TTLFromAnnotations(ants, resource)
 			providerSpecific, setIdentifier := annotations.ProviderSpecificAnnotations(ants)
 			for _, domain := range virtualHost.Domains {
-				endpoints = append(endpoints, EndpointsForHostname(strings.TrimSuffix(domain, "."), targets, ttl, providerSpecific, setIdentifier, "")...)
+				endpoints = append(endpoints, endpoint.EndpointsForHostname(strings.TrimSuffix(domain, "."), targets, ttl, providerSpecific, setIdentifier, "")...)
 			}
 		}
 	}
-	return endpoints, nil
+
+	return gs.templateEngine.ApplyTemplates(endpoints, p)
 }
 
 func (gs *glooSource) annotationsFromProxySource(virtualHost proxyVirtualHost) (map[string]string, error) {
@@ -309,7 +365,7 @@ func (gs *glooSource) proxyTargets(name string, namespace string) (endpoint.Targ
 
 	var targets endpoint.Targets
 	switch svc.Spec.Type {
-	case corev1.ServiceTypeLoadBalancer:
+	case v1.ServiceTypeLoadBalancer:
 		for _, lb := range svc.Status.LoadBalancer.Ingress {
 			if lb.IP != "" {
 				targets = append(targets, lb.IP)

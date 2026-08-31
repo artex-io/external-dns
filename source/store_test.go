@@ -22,83 +22,29 @@ import (
 	"testing"
 	"time"
 
-	openshift "github.com/openshift/client-go/route/clientset/versioned"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	istioclient "istio.io/client-go/pkg/clientset/versioned"
 	istiofake "istio.io/client-go/pkg/clientset/versioned/fake"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
 	fakeDynamic "k8s.io/client-go/dynamic/fake"
-	"k8s.io/client-go/kubernetes"
 	fakeKube "k8s.io/client-go/kubernetes/fake"
+
+	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/internal/testutils"
+	externaldns "sigs.k8s.io/external-dns/pkg/apis/externaldns"
+	"sigs.k8s.io/external-dns/source/template"
 	"sigs.k8s.io/external-dns/source/types"
-	gateway "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 )
-
-type MockClientGenerator struct {
-	mock.Mock
-	kubeClient              kubernetes.Interface
-	gatewayClient           gateway.Interface
-	istioClient             istioclient.Interface
-	dynamicKubernetesClient dynamic.Interface
-	openshiftClient         openshift.Interface
-}
-
-func (m *MockClientGenerator) KubeClient() (kubernetes.Interface, error) {
-	args := m.Called()
-	if args.Error(1) == nil {
-		m.kubeClient = args.Get(0).(kubernetes.Interface)
-		return m.kubeClient, nil
-	}
-	return nil, args.Error(1)
-}
-
-func (m *MockClientGenerator) GatewayClient() (gateway.Interface, error) {
-	args := m.Called()
-	if args.Error(1) != nil {
-		return nil, args.Error(1)
-	}
-	m.gatewayClient = args.Get(0).(gateway.Interface)
-	return m.gatewayClient, nil
-}
-
-func (m *MockClientGenerator) IstioClient() (istioclient.Interface, error) {
-	args := m.Called()
-	if args.Error(1) == nil {
-		m.istioClient = args.Get(0).(istioclient.Interface)
-		return m.istioClient, nil
-	}
-	return nil, args.Error(1)
-}
-
-func (m *MockClientGenerator) DynamicKubernetesClient() (dynamic.Interface, error) {
-	args := m.Called()
-	if args.Error(1) == nil {
-		m.dynamicKubernetesClient = args.Get(0).(dynamic.Interface)
-		return m.dynamicKubernetesClient, nil
-	}
-	return nil, args.Error(1)
-}
-
-func (m *MockClientGenerator) OpenShiftClient() (openshift.Interface, error) {
-	args := m.Called()
-	if args.Error(1) == nil {
-		m.openshiftClient = args.Get(0).(openshift.Interface)
-		return m.openshiftClient, nil
-	}
-	return nil, args.Error(1)
-}
 
 type ByNamesTestSuite struct {
 	suite.Suite
 }
 
 func (suite *ByNamesTestSuite) TestAllInitialized() {
-	mockClientGenerator := new(MockClientGenerator)
+	mockClientGenerator := new(testutils.MockClientGenerator)
 	mockClientGenerator.On("KubeClient").Return(fakeKube.NewSimpleClientset(), nil)
 	mockClientGenerator.On("IstioClient").Return(istiofake.NewSimpleClientset(), nil)
 	mockClientGenerator.On("DynamicKubernetesClient").Return(fakeDynamic.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
@@ -172,7 +118,7 @@ func (suite *ByNamesTestSuite) TestAllInitialized() {
 }
 
 func (suite *ByNamesTestSuite) TestOnlyFake() {
-	mockClientGenerator := new(MockClientGenerator)
+	mockClientGenerator := new(testutils.MockClientGenerator)
 	mockClientGenerator.On("KubeClient").Return(fakeKube.NewClientset(), nil)
 
 	sources, err := ByNames(context.TODO(), &Config{
@@ -180,11 +126,11 @@ func (suite *ByNamesTestSuite) TestOnlyFake() {
 	}, mockClientGenerator)
 	suite.NoError(err, "should not generate errors")
 	suite.Len(sources, 1, "should generate fake source")
-	suite.Nil(mockClientGenerator.kubeClient, "client should not be created")
+	suite.Nil(mockClientGenerator.KubeClientValue, "client should not be created")
 }
 
 func (suite *ByNamesTestSuite) TestSourceNotFound() {
-	mockClientGenerator := new(MockClientGenerator)
+	mockClientGenerator := new(testutils.MockClientGenerator)
 	mockClientGenerator.On("KubeClient").Return(fakeKube.NewClientset(), nil)
 	sources, err := ByNames(context.TODO(), &Config{
 		sources: []string{"foo"},
@@ -194,8 +140,9 @@ func (suite *ByNamesTestSuite) TestSourceNotFound() {
 }
 
 func (suite *ByNamesTestSuite) TestKubeClientFails() {
-	mockClientGenerator := new(MockClientGenerator)
+	mockClientGenerator := new(testutils.MockClientGenerator)
 	mockClientGenerator.On("KubeClient").Return(nil, errors.New("foo"))
+	mockClientGenerator.On("RESTConfig").Return(nil, errors.New("foo"))
 
 	sourceUnderTest := []string{
 		types.Node, types.Service, types.Ingress, types.Pod, types.IstioGateway, types.IstioVirtualService,
@@ -212,7 +159,7 @@ func (suite *ByNamesTestSuite) TestKubeClientFails() {
 }
 
 func (suite *ByNamesTestSuite) TestIstioClientFails() {
-	mockClientGenerator := new(MockClientGenerator)
+	mockClientGenerator := new(testutils.MockClientGenerator)
 	mockClientGenerator.On("KubeClient").Return(fakeKube.NewSimpleClientset(), nil)
 	mockClientGenerator.On("IstioClient").Return(nil, errors.New("foo"))
 	mockClientGenerator.On("DynamicKubernetesClient").Return(nil, errors.New("foo"))
@@ -228,7 +175,7 @@ func (suite *ByNamesTestSuite) TestIstioClientFails() {
 }
 
 func (suite *ByNamesTestSuite) TestDynamicKubernetesClientFails() {
-	mockClientGenerator := new(MockClientGenerator)
+	mockClientGenerator := new(testutils.MockClientGenerator)
 	mockClientGenerator.On("KubeClient").Return(fakeKube.NewClientset(), nil)
 	mockClientGenerator.On("IstioClient").Return(istiofake.NewSimpleClientset(), nil)
 	mockClientGenerator.On("DynamicKubernetesClient").Return(nil, errors.New("foo"))
@@ -250,26 +197,9 @@ func TestByNames(t *testing.T) {
 	suite.Run(t, new(ByNamesTestSuite))
 }
 
-type minimalMockClientGenerator struct{}
-
-var errMock = errors.New("mock not implemented")
-
-func (m *minimalMockClientGenerator) KubeClient() (kubernetes.Interface, error) { return nil, errMock }
-func (m *minimalMockClientGenerator) GatewayClient() (gateway.Interface, error) { return nil, errMock }
-func (m *minimalMockClientGenerator) IstioClient() (istioclient.Interface, error) {
-	return nil, errMock
-}
-
-func (m *minimalMockClientGenerator) DynamicKubernetesClient() (dynamic.Interface, error) {
-	return nil, errMock
-}
-func (m *minimalMockClientGenerator) OpenShiftClient() (openshift.Interface, error) {
-	return nil, errMock
-}
-
 func TestBuildWithConfig_InvalidSource(t *testing.T) {
-	ctx := context.Background()
-	p := &minimalMockClientGenerator{}
+	ctx := t.Context()
+	p := testutils.StubClientGenerator{}
 	cfg := &Config{LabelFilter: labels.NewSelector()}
 
 	src, err := BuildWithConfig(ctx, "not-a-source", p, cfg)
@@ -281,46 +211,298 @@ func TestBuildWithConfig_InvalidSource(t *testing.T) {
 	}
 }
 
-func TestConfig_ClientGenerator(t *testing.T) {
-	cfg := &Config{
-		KubeConfig:     "/path/to/kubeconfig",
-		APIServerURL:   "https://api.example.com",
-		RequestTimeout: 30 * time.Second,
-		UpdateEvents:   false,
+func TestBuildWithConfig_ScopesTemplateEngineToSource(t *testing.T) {
+	ctx := t.Context()
+	p := testutils.StubClientGenerator{}
+	engine, err := template.NewEngine([]string{`{{ if isSource "fake" }}yes{{ else }}no{{ end }}.example.com`}, nil, nil, false)
+	require.NoError(t, err)
+	cfg := &Config{TemplateEngine: engine}
+
+	src, err := BuildWithConfig(ctx, types.Fake, p, cfg)
+	require.NoError(t, err)
+
+	eps, err := src.Endpoints(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, eps)
+
+	// NS record's DNSName is the rendered FQDN template output.
+	var found bool
+	for _, ep := range eps {
+		if ep.RecordType == endpoint.RecordTypeNS {
+			assert.Equal(t, "yes.example.com", ep.DNSName)
+			found = true
+		}
 	}
-
-	gen := cfg.ClientGenerator()
-
-	assert.Equal(t, "/path/to/kubeconfig", gen.KubeConfig)
-	assert.Equal(t, "https://api.example.com", gen.APIServerURL)
-	assert.Equal(t, 30*time.Second, gen.RequestTimeout)
-}
-
-func TestConfig_ClientGenerator_UpdateEvents(t *testing.T) {
-	cfg := &Config{
-		KubeConfig:     "/path/to/kubeconfig",
-		APIServerURL:   "https://api.example.com",
-		RequestTimeout: 30 * time.Second,
-		UpdateEvents:   true, // Special case
-	}
-
-	gen := cfg.ClientGenerator()
-
-	assert.Equal(t, time.Duration(0), gen.RequestTimeout, "UpdateEvents should set timeout to 0")
+	assert.True(t, found, "expected an NS endpoint")
 }
 
 func TestConfig_ClientGenerator_Caching(t *testing.T) {
 	cfg := &Config{
-		KubeConfig:     "/path/to/kubeconfig",
-		APIServerURL:   "https://api.example.com",
-		RequestTimeout: 30 * time.Second,
-		UpdateEvents:   false,
+		KubeConfig:            "/path/to/kubeconfig",
+		APIServerURL:          "https://api.example.com",
+		KubeAPIRequestTimeout: 30 * time.Second,
 	}
 
-	// Call ClientGenerator twice
 	gen1 := cfg.ClientGenerator()
 	gen2 := cfg.ClientGenerator()
 
-	// Should return the same instance (cached)
 	assert.Same(t, gen1, gen2, "ClientGenerator should return the same cached instance")
+}
+
+// TestSingletonClientGenerator_RESTConfig_TimeoutPropagation verifies timeout configuration
+func TestSingletonClientGenerator_RESTConfig_TimeoutPropagation(t *testing.T) {
+	testCases := []struct {
+		name           string
+		requestTimeout time.Duration
+	}{
+		{
+			name:           "30 second timeout",
+			requestTimeout: 30 * time.Second,
+		},
+		{
+			name:           "60 second timeout",
+			requestTimeout: 60 * time.Second,
+		},
+		{
+			name:           "zero timeout (for watches)",
+			requestTimeout: 0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			gen := &SingletonClientGenerator{
+				KubeConfig:     "",
+				APIServerURL:   "",
+				RequestTimeout: tc.requestTimeout,
+			}
+
+			// Verify the generator was configured with correct timeout
+			assert.Equal(t, tc.requestTimeout, gen.RequestTimeout,
+				"SingletonClientGenerator should have the configured RequestTimeout")
+
+			config, err := gen.RESTConfig()
+
+			// Even if config creation failed, verify the timeout was set in generator
+			assert.Equal(t, tc.requestTimeout, gen.RequestTimeout,
+				"RequestTimeout should remain unchanged after RESTConfig() call")
+
+			// If config was successfully created, verify timeout propagated correctly
+			if err == nil {
+				require.NotNil(t, config, "Config should not be nil when error is nil")
+				assert.Equal(t, tc.requestTimeout, config.Timeout,
+					"REST config should have timeout matching RequestTimeout field")
+			}
+		})
+	}
+}
+
+// TestConfig_ClientGenerator_RESTConfig_Integration verifies Config → ClientGenerator → RESTConfig flow
+func TestConfig_ClientGenerator_RESTConfig_Integration(t *testing.T) {
+	t.Run("normal timeout is propagated", func(t *testing.T) {
+		cfg := &Config{KubeAPIRequestTimeout: 45 * time.Second}
+
+		config, err := cfg.ClientGenerator().RESTConfig()
+		if err == nil {
+			require.NotNil(t, config)
+			assert.Equal(t, 45*time.Second, config.Timeout, "RESTConfig should propagate the timeout")
+		}
+	})
+
+	t.Run("UpdateEvents sets timeout to zero", func(t *testing.T) {
+		cfg := &Config{KubeAPIRequestTimeout: 45 * time.Second, UpdateEvents: true}
+
+		config, err := cfg.ClientGenerator().RESTConfig()
+		if err == nil {
+			require.NotNil(t, config)
+			assert.Equal(t, time.Duration(0), config.Timeout, "RESTConfig should have zero timeout for watch operations")
+		}
+	})
+}
+
+// TestSingletonClientGenerator_RESTConfig_SharedAcrossClients verifies singleton is shared
+func TestSingletonClientGenerator_RESTConfig_SharedAcrossClients(t *testing.T) {
+	gen := &SingletonClientGenerator{
+		KubeConfig:     "/nonexistent/path/to/kubeconfig",
+		APIServerURL:   "",
+		RequestTimeout: 30 * time.Second,
+	}
+
+	// Get REST config multiple times
+	restConfig1, err1 := gen.RESTConfig()
+	restConfig2, err2 := gen.RESTConfig()
+	restConfig3, err3 := gen.RESTConfig()
+
+	// Verify singleton behavior - all should return same instance
+	assert.Same(t, restConfig1, restConfig2, "RESTConfig should return same instance on second call")
+	assert.Same(t, restConfig1, restConfig3, "RESTConfig should return same instance on third call")
+
+	// Verify the internal field matches
+	assert.Same(t, restConfig1, gen.restConfig,
+		"Internal restConfig field should match returned value")
+
+	// All calls should return the same error
+	assert.Error(t, err1, "First call should return error when kubeconfig is invalid")
+	assert.Equal(t, err1, err2, "Second call should return same error as first call")
+	assert.Equal(t, err1, err3, "Third call should return same error as first call")
+}
+
+// TestSingletonClientGenerator_ErrorPersistence verifies that initialization errors
+// are persisted in struct fields and returned consistently on every subsequent call.
+func TestSingletonClientGenerator_ErrorPersistence(t *testing.T) {
+	gen := &SingletonClientGenerator{
+		KubeConfig:     "/nonexistent/path/to/kubeconfig",
+		APIServerURL:   "",
+		RequestTimeout: 30 * time.Second,
+	}
+
+	methods := []struct {
+		name string
+		call func() (any, error)
+	}{
+		{"RESTConfig", func() (any, error) { return gen.RESTConfig() }},
+		{"KubeClient", func() (any, error) { return gen.KubeClient() }},
+		{"GatewayClient", func() (any, error) { return gen.GatewayClient() }},
+		{"IstioClient", func() (any, error) { return gen.IstioClient() }},
+		{"DynamicKubernetesClient", func() (any, error) { return gen.DynamicKubernetesClient() }},
+		{"OpenShiftClient", func() (any, error) { return gen.OpenShiftClient() }},
+	}
+
+	for _, m := range methods {
+		t.Run(m.name, func(t *testing.T) {
+			client1, err1 := m.call()
+			require.Error(t, err1, "first call must return an error for invalid kubeconfig")
+			assert.Nil(t, client1, "first call must return nil client on error")
+
+			client2, err2 := m.call()
+			require.Error(t, err2, "second call must still return the init error, not nil")
+			assert.Nil(t, client2, "second call must return nil client on error")
+			assert.Equal(t, err1, err2, "second call must return the same error as first call")
+
+			client3, err3 := m.call()
+			require.Error(t, err3, "third call must still return the init error, not nil")
+			assert.Nil(t, client3, "third call must return nil client on error")
+			assert.Equal(t, err1, err3, "third call must return the same error as first call")
+		})
+	}
+}
+
+func TestNewSourceConfig(t *testing.T) {
+	tests := []struct {
+		name           string
+		cfg            *externaldns.Config
+		wantConfigured bool
+		wantCombining  bool
+		wantErr        bool
+		errContains    string
+	}{
+		{
+			name: "no templates configured",
+			cfg:  &externaldns.Config{},
+		},
+		{
+			name: "fqdn template only",
+			cfg: &externaldns.Config{
+				FQDNTemplate: []string{"{{.Name}}.example.com"},
+			},
+			wantConfigured: true,
+		},
+		{
+			name: "fqdn template with combine",
+			cfg: &externaldns.Config{
+				FQDNTemplate:             []string{"{{.Name}}.example.com"},
+				CombineFQDNAndAnnotation: true,
+			},
+			wantConfigured: true,
+			wantCombining:  true,
+		},
+		{
+			name: "all three templates configured",
+			cfg: &externaldns.Config{
+				FQDNTemplate:             []string{"{{.Name}}.example.com"},
+				TargetTemplate:           []string{"{{.Name}}.targets.example.com"},
+				FQDNTargetTemplate:       []string{"{{.Name}}.example.com:{{.Name}}.targets.example.com"},
+				CombineFQDNAndAnnotation: true,
+			},
+			wantConfigured: true,
+			wantCombining:  true,
+		},
+		{
+			name: "multiple fqdn templates",
+			cfg: &externaldns.Config{
+				FQDNTemplate: []string{"{{.Name}}.a.example.com", "{{.Name}}.b.example.com"},
+			},
+			wantConfigured: true,
+		},
+		{
+			name:        "invalid fqdn template",
+			cfg:         &externaldns.Config{FQDNTemplate: []string{"{{.Name"}},
+			wantErr:     true,
+			errContains: `--fqdn-template[0]`,
+		},
+		{
+			name:        "invalid target template",
+			cfg:         &externaldns.Config{TargetTemplate: []string{"{{.Status.LoadBalancer.Ingress"}},
+			wantErr:     true,
+			errContains: `--target-template[0]`,
+		},
+		{
+			name:        "invalid fqdn-target template",
+			cfg:         &externaldns.Config{FQDNTargetTemplate: []string{"{{.Name}}.example.com:{{.Status"}},
+			wantErr:     true,
+			errContains: `--fqdn-target-template[0]`,
+		},
+		{
+			name: "duplicate define block in fqdn templates",
+			cfg: &externaldns.Config{
+				FQDNTemplate: []string{
+					`{{ define "zone" }}example.com{{ end }}{{.Name}}.{{ template "zone" }}`,
+					`{{ define "zone" }}other.com{{ end }}{{.Name}}.{{ template "zone" }}`,
+				},
+			},
+			wantErr:     true,
+			errContains: `--fqdn-template[1]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewSourceConfig(tt.cfg)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					assert.ErrorContains(t, err, tt.errContains)
+				}
+				return
+			}
+			require.NoError(t, err)
+			tmpl := got.TemplateEngine
+			assert.Equal(t, tt.wantConfigured, tmpl.IsConfigured(), "IsConfigured")
+			assert.Equal(t, tt.wantCombining, tmpl.Combining(), "Combining")
+		})
+	}
+}
+
+func TestKubeAPIRateLimitPropagation(t *testing.T) {
+	t.Run("NewSourceConfig propagates QPS and burst", func(t *testing.T) {
+		cfg := &externaldns.Config{
+			KubeAPIQPS:   20,
+			KubeAPIBurst: 40,
+		}
+		got, err := NewSourceConfig(cfg)
+		require.NoError(t, err)
+		assert.Equal(t, 20, got.KubeAPIQPS)
+		assert.Equal(t, 40, got.KubeAPIBurst)
+	})
+
+	t.Run("ClientGenerator wires QPS and burst into SingletonClientGenerator", func(t *testing.T) {
+		cfg := &Config{
+			KubeAPIQPS:   15,
+			KubeAPIBurst: 30,
+		}
+		scg, ok := cfg.ClientGenerator().(*SingletonClientGenerator)
+		require.True(t, ok)
+		assert.Equal(t, 15, scg.QPS)
+		assert.Equal(t, 30, scg.Burst)
+	})
 }

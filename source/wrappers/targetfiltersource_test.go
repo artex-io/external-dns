@@ -19,9 +19,10 @@ package wrappers
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/net/context"
 
+	"sigs.k8s.io/external-dns/internal/sets"
 	"sigs.k8s.io/external-dns/internal/testutils"
 	"sigs.k8s.io/external-dns/source"
 
@@ -29,19 +30,15 @@ import (
 )
 
 type mockTargetNetFilter struct {
-	targets map[string]bool
+	targets sets.Set[string]
 }
 
 func NewMockTargetNetFilter(targets []string) endpoint.TargetFilterInterface {
-	targetMap := make(map[string]bool)
-	for _, target := range targets {
-		targetMap[target] = true
-	}
-	return &mockTargetNetFilter{targets: targetMap}
+	return &mockTargetNetFilter{targets: sets.New(targets...)}
 }
 
 func (m *mockTargetNetFilter) Match(target string) bool {
-	return m.targets[target]
+	return m.targets.Has(target)
 }
 
 func (m *mockTargetNetFilter) IsEnabled() bool {
@@ -58,7 +55,7 @@ func TestEchoSourceReturnGivenSources(t *testing.T) {
 	}}
 	e := testutils.NewMockSource(startEndpoints...)
 
-	endpoints, err := e.Endpoints(context.Background())
+	endpoints, err := e.Endpoints(t.Context())
 	if err != nil {
 		t.Errorf("Expected no error but got %s", err.Error())
 	}
@@ -127,11 +124,21 @@ func TestTargetFilterSourceEndpoints(t *testing.T) {
 			echo := testutils.NewMockSource(tt.endpoints...)
 			src := NewTargetFilterSource(echo, tt.filters)
 
-			endpoints, err := src.Endpoints(context.Background())
+			endpoints, err := src.Endpoints(t.Context())
 			require.NoError(t, err, "failed to get Endpoints")
-			validateEndpoints(t, endpoints, tt.expected)
+			testutils.ValidateEndpoints(t, endpoints, tt.expected)
 		})
 	}
+
+	t.Run("wrapped source error is propagated", func(t *testing.T) {
+		t.Parallel()
+		m := testutils.NewMockSource()
+		m.On("Endpoints").Unset()
+		m.On("Endpoints").Return([]*endpoint.Endpoint(nil), assert.AnError)
+		src := NewTargetFilterSource(m, NewMockTargetNetFilter([]string{}))
+		_, err := src.Endpoints(t.Context())
+		require.ErrorIs(t, err, assert.AnError)
+	})
 }
 
 func TestTargetFilterConcreteTargetFilter(t *testing.T) {
@@ -209,10 +216,10 @@ func TestTargetFilterConcreteTargetFilter(t *testing.T) {
 			echo := testutils.NewMockSource(tt.endpoints...)
 			src := NewTargetFilterSource(echo, tt.filters)
 
-			endpoints, err := src.Endpoints(context.Background())
+			endpoints, err := src.Endpoints(t.Context())
 			require.NoError(t, err, "failed to get Endpoints")
 
-			validateEndpoints(t, endpoints, tt.expected)
+			testutils.ValidateEndpoints(t, endpoints, tt.expected)
 		})
 	}
 }

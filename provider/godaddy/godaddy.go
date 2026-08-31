@@ -27,6 +27,8 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/internal/sets"
+	"sigs.k8s.io/external-dns/pkg/apis/externaldns"
 	"sigs.k8s.io/external-dns/plan"
 	"sigs.k8s.io/external-dns/provider"
 )
@@ -136,8 +138,8 @@ func (z gdZoneIDName) findZoneRecord(hostname string) (string, *gdRecords) {
 	return suitableZoneID, suitableZoneRecord
 }
 
-// NewGoDaddyProvider initializes a new GoDaddy DNS based Provider.
-func NewGoDaddyProvider(_ context.Context, domainFilter *endpoint.DomainFilter, ttl int64, apiKey, apiSecret string, useOTE, dryRun bool) (*GDProvider, error) {
+// newProvider initializes a new GoDaddy DNS based Provider.
+func newProvider(domainFilter *endpoint.DomainFilter, ttl int64, apiKey, apiSecret string, useOTE, dryRun bool) (*GDProvider, error) {
 	client, err := NewClient(useOTE, apiKey, apiSecret)
 	if err != nil {
 		return nil, err
@@ -149,6 +151,11 @@ func NewGoDaddyProvider(_ context.Context, domainFilter *endpoint.DomainFilter, 
 		ttl:          maxOf(defaultTTL, ttl),
 		DryRun:       dryRun,
 	}, nil
+}
+
+// New creates a GoDaddy provider from the given configuration.
+func New(_ context.Context, cfg *externaldns.Config, domainFilter *endpoint.DomainFilter) (provider.Provider, error) {
+	return newProvider(domainFilter, cfg.GoDaddyTTL, cfg.GoDaddyAPIKey, cfg.GoDaddySecretKey, cfg.GoDaddyOTE, cfg.DryRun)
 }
 
 func (p *GDProvider) zones() ([]string, error) {
@@ -390,29 +397,27 @@ func (p *GDProvider) ApplyChanges(ctx context.Context, changes *plan.Changes) er
 
 	allChanges = p.appendChange(gdDelete, changes.Delete, allChanges)
 
-	iOldSkip := make(map[int]bool)
-	iNewSkip := make(map[int]bool)
+	iOldSkip := sets.New[int]()
+	iNewSkip := sets.New[int]()
 
 	for iOld, recOld := range changes.UpdateOld {
 		for iNew, recNew := range changes.UpdateNew {
 			if recOld.DNSName == recNew.DNSName && recOld.RecordType == recNew.RecordType {
 				ReplaceEndpoints := []*endpoint.Endpoint{recNew}
 				allChanges = p.appendChange(gdReplace, ReplaceEndpoints, allChanges)
-				iOldSkip[iOld] = true
-				iNewSkip[iNew] = true
+				iOldSkip.Insert(iOld)
+				iNewSkip.Insert(iNew)
 				break
 			}
 		}
 	}
 
 	for iOld, recOld := range changes.UpdateOld {
-		_, found := iOldSkip[iOld]
-		if found {
+		if iOldSkip.Has(iOld) {
 			continue
 		}
 		for iNew, recNew := range changes.UpdateNew {
-			_, found := iNewSkip[iNew]
-			if found {
+			if iNewSkip.Has(iNew) {
 				continue
 			}
 

@@ -14,12 +14,21 @@ limitations under the License.
 package annotations
 
 import (
+	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
 	"sigs.k8s.io/external-dns/endpoint"
 )
+
+func TestMain(m *testing.M) {
+	// Initialize annotation prefixes before running tests
+	SetAnnotationPrefix(DefaultAnnotationPrefix)
+	os.Exit(m.Run())
+}
 
 func TestProviderSpecificAnnotations(t *testing.T) {
 	tests := []struct {
@@ -57,7 +66,7 @@ func TestProviderSpecificAnnotations(t *testing.T) {
 		{
 			name: "AWS annotation",
 			annotations: map[string]string{
-				"external-dns.alpha.kubernetes.io/aws-weight": "100",
+				"external-dns.kubernetes.io/aws-weight": "100",
 			},
 			expected: endpoint.ProviderSpecific{
 				{Name: "aws/weight", Value: "100"},
@@ -67,10 +76,30 @@ func TestProviderSpecificAnnotations(t *testing.T) {
 		{
 			name: "CoreDNS annotation",
 			annotations: map[string]string{
-				"external-dns.alpha.kubernetes.io/coredns-group": "g1",
+				"external-dns.kubernetes.io/coredns-group": "g1",
 			},
 			expected: endpoint.ProviderSpecific{
 				{Name: "coredns/group", Value: "g1"},
+			},
+			setIdentifier: "",
+		},
+		{
+			name: "Azure tags annotation",
+			annotations: map[string]string{
+				AzureTagsKey: "cost-center=12345,owner=backend-team",
+			},
+			expected: endpoint.ProviderSpecific{
+				{Name: "azure/tags", Value: "cost-center=12345,owner=backend-team"},
+			},
+			setIdentifier: "",
+		},
+		{
+			name: "Azure tags annotation with spaces",
+			annotations: map[string]string{
+				AzureTagsKey: "environment=production, app=myapp ",
+			},
+			expected: endpoint.ProviderSpecific{
+				{Name: "azure/tags", Value: "environment=production, app=myapp "},
 			},
 			setIdentifier: "",
 		},
@@ -82,6 +111,16 @@ func TestProviderSpecificAnnotations(t *testing.T) {
 			expected:      endpoint.ProviderSpecific{},
 			setIdentifier: "identifier",
 		},
+		{
+			name: "Record type annotation",
+			annotations: map[string]string{
+				RecordTypeKey: "ptr",
+			},
+			expected: endpoint.ProviderSpecific{
+				{Name: endpoint.ProviderSpecificRecordType, Value: "ptr"},
+			},
+			setIdentifier: "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -89,6 +128,15 @@ func TestProviderSpecificAnnotations(t *testing.T) {
 			result, setIdentifier := ProviderSpecificAnnotations(tt.annotations)
 			assert.Equal(t, tt.expected, result)
 			assert.Equal(t, tt.setIdentifier, setIdentifier)
+
+			for _, prop := range result {
+				slashIdx := strings.Index(prop.Name, "/")
+				if slashIdx == -1 || strings.HasPrefix(prop.Name, CloudflarePrefix) {
+					continue
+				}
+				assert.NotContains(t, prop.Name[:slashIdx], ".",
+					"property %q uses a full annotation name; only cloudflare is allowed to — use the short \"provider/attr\" form instead", prop.Name)
+			}
 		})
 	}
 }
@@ -275,7 +323,7 @@ func TestGetProviderSpecificAliasAnnotations(t *testing.T) {
 		t.Run(tc.title, func(t *testing.T) {
 			providerSpecificAnnotations, _ := ProviderSpecificAnnotations(tc.annotations)
 			for _, providerSpecificAnnotation := range providerSpecificAnnotations {
-				if providerSpecificAnnotation.Name == "alias" {
+				if providerSpecificAnnotation.Name == endpoint.ProviderSpecificAlias {
 					assert.Equal(t, strconv.FormatBool(tc.expectedValue), providerSpecificAnnotation.Value)
 					return
 				}
@@ -303,12 +351,50 @@ func TestGetProviderSpecificAliasAnnotations(t *testing.T) {
 		t.Run(tc.title, func(t *testing.T) {
 			providerSpecificAnnotations, _ := ProviderSpecificAnnotations(tc.annotations)
 			for _, providerSpecificAnnotation := range providerSpecificAnnotations {
-				if providerSpecificAnnotation.Name == "alias" {
+				if providerSpecificAnnotation.Name == endpoint.ProviderSpecificAlias {
 					t.Error("provider specific annotation alias is not expected to be set")
 				}
 			}
 
 		})
+	}
+}
+
+// TestProviderSpecificPropertyNameConvention enforces that only Cloudflare may
+// emit the full annotation name (e.g. "external-dns.kubernetes.io/cloudflare-proxied")
+// as a property name. All other providers must normalise to the short "provider/attr" form
+// (e.g. "aws/weight"). If a new provider (e.g. azure-, ovh-) is added but accidentally
+// outputs the full annotation name, this test will catch it.
+func TestProviderSpecificPropertyNameConvention(t *testing.T) {
+	annotations := map[string]string{
+		AnnotationKeyPrefix + "aws-weight":        "10",
+		AnnotationKeyPrefix + "scw-something":     "val",
+		AnnotationKeyPrefix + "webhook-something": "val",
+		AnnotationKeyPrefix + "coredns-group":     "g1",
+		CloudflareProxiedKey:                      "true",
+		CloudflareTagsKey:                         "tag1",
+		CloudflareRegionKey:                       "us",
+		CloudflareRecordCommentKey:                "comment",
+		CloudflareCustomHostnameKey:               "host.example.com",
+		AliasKey:                                  "true",
+	}
+
+	props, _ := ProviderSpecificAnnotations(annotations)
+	for _, prop := range props {
+		name := prop.Name
+		providerSegment, _, ok := strings.Cut(name, "/")
+		if !ok {
+			// No slash: provider-agnostic property (e.g. "alias") — always OK.
+			continue
+		}
+		// Cloudflare exception: retains the full annotation name.
+		if strings.HasPrefix(name, CloudflarePrefix) {
+			continue
+		}
+		// All other providers must use the short "provider/attr" form.
+		// The segment before "/" must be a plain word with no dots.
+		assert.NotContains(t, providerSegment, ".",
+			"property %q uses a full annotation name; only cloudflare is allowed to — use the short \"provider/attr\" form instead", name)
 	}
 }
 
@@ -322,9 +408,9 @@ func TestGetProviderSpecificIdentifierAnnotations(t *testing.T) {
 		{
 			title: "aws- provider specific annotations are set correctly",
 			annotations: map[string]string{
-				"external-dns.alpha.kubernetes.io/aws-annotation-1": "value 1",
+				"external-dns.kubernetes.io/aws-annotation-1": "value 1",
 				SetIdentifierKey: "id1",
-				"external-dns.alpha.kubernetes.io/aws-annotation-2": "value 2",
+				"external-dns.kubernetes.io/aws-annotation-2": "value 2",
 			},
 			expectedResult: map[string]string{
 				"aws/annotation-1": "value 1",
@@ -335,9 +421,9 @@ func TestGetProviderSpecificIdentifierAnnotations(t *testing.T) {
 		{
 			title: "scw- provider specific annotations are set correctly",
 			annotations: map[string]string{
-				"external-dns.alpha.kubernetes.io/scw-annotation-1": "value 1",
+				"external-dns.kubernetes.io/scw-annotation-1": "value 1",
 				SetIdentifierKey: "id1",
-				"external-dns.alpha.kubernetes.io/scw-annotation-2": "value 2",
+				"external-dns.kubernetes.io/scw-annotation-2": "value 2",
 			},
 			expectedResult: map[string]string{
 				"scw/annotation-1": "value 1",
@@ -348,9 +434,9 @@ func TestGetProviderSpecificIdentifierAnnotations(t *testing.T) {
 		{
 			title: "webhook- provider specific annotations are set correctly",
 			annotations: map[string]string{
-				"external-dns.alpha.kubernetes.io/webhook-annotation-1": "value 1",
+				"external-dns.kubernetes.io/webhook-annotation-1": "value 1",
 				SetIdentifierKey: "id1",
-				"external-dns.alpha.kubernetes.io/webhook-annotation-2": "value 2",
+				"external-dns.kubernetes.io/webhook-annotation-2": "value 2",
 			},
 			expectedResult: map[string]string{
 				"webhook/annotation-1": "value 1",

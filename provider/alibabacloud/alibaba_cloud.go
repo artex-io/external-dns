@@ -33,6 +33,8 @@ import (
 	"github.com/goccy/go-yaml"
 	log "github.com/sirupsen/logrus"
 
+	"sigs.k8s.io/external-dns/pkg/apis/externaldns"
+
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
 	"sigs.k8s.io/external-dns/provider"
@@ -95,10 +97,15 @@ type alibabaCloudConfig struct {
 	ExpireTime      time.Time `json:"-"               yaml:"-"`
 }
 
-// NewAlibabaCloudProvider creates a new Alibaba Cloud provider.
+// New creates an Alibaba Cloud provider from the given configuration.
+func New(_ context.Context, cfg *externaldns.Config, domainFilter *endpoint.DomainFilter) (provider.Provider, error) {
+	return newProvider(cfg.AlibabaCloudConfigFile, domainFilter, provider.NewZoneIDFilter(cfg.ZoneIDFilter), cfg.AlibabaCloudZoneType, cfg.DryRun)
+}
+
+// newAlibabaCloudProvider creates a new Alibaba Cloud provider.
 //
 // Returns the provider or an error if a provider could not be created.
-func NewAlibabaCloudProvider(configFile string, domainFilter *endpoint.DomainFilter, zoneIDFileter provider.ZoneIDFilter, zoneType string, dryRun bool) (*AlibabaCloudProvider, error) {
+func newProvider(configFile string, domainFilter *endpoint.DomainFilter, zoneIDFileter provider.ZoneIDFilter, zoneType string, dryRun bool) (*AlibabaCloudProvider, error) {
 	cfg := alibabaCloudConfig{}
 	if configFile != "" {
 		contents, err := os.ReadFile(configFile)
@@ -331,11 +338,7 @@ func (p *AlibabaCloudProvider) recordsForDNS() ([]*endpoint.Endpoint, error) {
 
 		var targets []string
 		for _, record := range recordList {
-			target := record.Value
-			if recordType == "TXT" {
-				target = p.unescapeTXTRecordValue(target)
-			}
-			targets = append(targets, target)
+			targets = append(targets, record.Value)
 		}
 		ep := endpoint.NewEndpointWithTTL(name, recordType, endpoint.TTL(ttl), targets...)
 		endpoints = append(endpoints, ep)
@@ -343,8 +346,8 @@ func (p *AlibabaCloudProvider) recordsForDNS() ([]*endpoint.Endpoint, error) {
 	return endpoints, nil
 }
 
-func getNextPageNumber(pageNumber, pageSize, totalCount int64) int64 {
-	if pageNumber*pageSize >= totalCount {
+func getNextPageNumber(pageNumber, totalCount int64) int64 {
+	if pageNumber*defaultAlibabaCloudPageSize >= totalCount {
 		return 0
 	}
 	return pageNumber + 1
@@ -417,7 +420,7 @@ func (p *AlibabaCloudProvider) getDomainList() ([]string, error) {
 		for _, tmpDomain := range resp.Domains.Domain {
 			domainNames = append(domainNames, tmpDomain.DomainName)
 		}
-		nextPage := getNextPageNumber(resp.PageNumber, defaultAlibabaCloudPageSize, resp.TotalCount)
+		nextPage := getNextPageNumber(resp.PageNumber, resp.TotalCount)
 		if nextPage == 0 {
 			break
 		} else {
@@ -451,10 +454,12 @@ func (p *AlibabaCloudProvider) getDomainRecords(domainName string) ([]alidns.Rec
 			if !provider.SupportedRecordType(recordType) {
 				continue
 			}
+			// Use the same format as ExternalDNS
+			record.Value = wrapWithQuotes(recordType, record.Value)
 			// TODO filter Locked record
 			results = append(results, record)
 		}
-		nextPage := getNextPageNumber(response.PageNumber, defaultAlibabaCloudPageSize, response.TotalCount)
+		nextPage := getNextPageNumber(response.PageNumber, response.TotalCount)
 		if nextPage == 0 {
 			break
 		} else {
@@ -486,14 +491,18 @@ func (p *AlibabaCloudProvider) applyChangesForDNS(changes *plan.Changes) error {
 	return nil
 }
 
-func (p *AlibabaCloudProvider) escapeTXTRecordValue(value string) string {
-	// For unsupported chars
-	return value
+func unwrapQuotes(recordType, target string) string {
+	if recordType == endpoint.RecordTypeTXT && strings.HasPrefix(target, `"heritage=`) {
+		return strings.Trim(target, `"`)
+	}
+	return target
 }
 
-func (p *AlibabaCloudProvider) unescapeTXTRecordValue(value string) string {
-	if strings.HasPrefix(value, "heritage=") {
-		return fmt.Sprintf("\"%s\"", strings.ReplaceAll(value, ";", ","))
+func wrapWithQuotes(recordType, value string) string {
+	if recordType == endpoint.RecordTypeTXT && strings.HasPrefix(value, "heritage=") {
+		// Alibaba Cloud returns TXT record values without quotes.
+		// Restore the quotes to match ExternalDNS's expected format.
+		return fmt.Sprintf("\"%s\"", value)
 	}
 	return value
 }
@@ -524,10 +533,6 @@ func (p *AlibabaCloudProvider) createRecord(endpoint *endpoint.Endpoint, target 
 		request.TTL = requests.NewInteger(ttl)
 	}
 
-	if endpoint.RecordType == "TXT" {
-		target = p.escapeTXTRecordValue(target)
-	}
-
 	request.Value = target
 
 	if p.dryRun {
@@ -544,13 +549,12 @@ func (p *AlibabaCloudProvider) createRecord(endpoint *endpoint.Endpoint, target 
 	return err
 }
 
-func (p *AlibabaCloudProvider) createRecords(endpoints []*endpoint.Endpoint, hostedZoneDomains []string) error {
+func (p *AlibabaCloudProvider) createRecords(endpoints []*endpoint.Endpoint, hostedZoneDomains []string) {
 	for _, endpoint := range endpoints {
 		for _, target := range endpoint.Targets {
 			p.createRecord(endpoint, target, hostedZoneDomains)
 		}
 	}
-	return nil
 }
 
 func (p *AlibabaCloudProvider) deleteRecord(recordID string) error {
@@ -591,18 +595,13 @@ func (p *AlibabaCloudProvider) updateRecord(record alidns.Record, endpoint *endp
 	return err
 }
 
-func (p *AlibabaCloudProvider) deleteRecords(recordMap map[string][]alidns.Record, endpoints []*endpoint.Endpoint) error {
+func (p *AlibabaCloudProvider) deleteRecords(recordMap map[string][]alidns.Record, endpoints []*endpoint.Endpoint) {
 	for _, endpoint := range endpoints {
 		key := p.getRecordKeyByEndpoint(endpoint)
 		records := recordMap[key]
 		found := false
 		for _, record := range records {
-			value := record.Value
-			if record.Type == "TXT" {
-				value = p.unescapeTXTRecordValue(value)
-			}
-
-			if slices.Contains(endpoint.Targets, value) {
+			if slices.Contains(endpoint.Targets, record.Value) {
 				p.deleteRecord(record.RecordId)
 				found = true
 			}
@@ -611,7 +610,6 @@ func (p *AlibabaCloudProvider) deleteRecords(recordMap map[string][]alidns.Recor
 			log.Errorf("Failed to find %s record named '%s' to delete for Alibaba Cloud DNS", endpoint.RecordType, endpoint.DNSName)
 		}
 	}
-	return nil
 }
 
 func (p *AlibabaCloudProvider) equals(record alidns.Record, endpoint *endpoint.Endpoint) bool {
@@ -628,22 +626,12 @@ func (p *AlibabaCloudProvider) equals(record alidns.Record, endpoint *endpoint.E
 	return ttl1 == ttl2
 }
 
-func (p *AlibabaCloudProvider) updateRecords(recordMap map[string][]alidns.Record, endpoints []*endpoint.Endpoint, hostedZoneDomains []string) error {
+func (p *AlibabaCloudProvider) updateRecords(recordMap map[string][]alidns.Record, endpoints []*endpoint.Endpoint, hostedZoneDomains []string) {
 	for _, endpoint := range endpoints {
 		key := p.getRecordKeyByEndpoint(endpoint)
 		records := recordMap[key]
 		for _, record := range records {
-			value := record.Value
-			if record.Type == "TXT" {
-				value = p.unescapeTXTRecordValue(value)
-			}
-			found := false
-			for _, target := range endpoint.Targets {
-				// Find matched record to delete
-				if value == target {
-					found = true
-				}
-			}
+			found := slices.Contains(endpoint.Targets, record.Value)
 			if found {
 				if !p.equals(record, endpoint) {
 					// Update record
@@ -654,22 +642,14 @@ func (p *AlibabaCloudProvider) updateRecords(recordMap map[string][]alidns.Recor
 			}
 		}
 		for _, target := range endpoint.Targets {
-			if endpoint.RecordType == "TXT" {
-				target = p.escapeTXTRecordValue(target)
-			}
-			found := false
-			for _, record := range records {
-				// Find matched record to delete
-				if record.Value == target {
-					found = true
-				}
-			}
+			found := slices.ContainsFunc(records, func(record alidns.Record) bool {
+				return record.Value == target
+			})
 			if !found {
 				p.createRecord(endpoint, target, hostedZoneDomains)
 			}
 		}
 	}
-	return nil
 }
 
 func (p *AlibabaCloudProvider) splitDNSName(dnsName string, hostedZoneDomains []string) (string, string) {
@@ -747,7 +727,7 @@ func (p *AlibabaCloudProvider) privateZones() ([]pvtz.Zone, error) {
 			}
 			zones = append(zones, zone)
 		}
-		nextPage := getNextPageNumber(int64(response.PageNumber), defaultAlibabaCloudPageSize, int64(response.TotalItems))
+		nextPage := getNextPageNumber(int64(response.PageNumber), int64(response.TotalItems))
 		if nextPage == 0 {
 			break
 		} else {
@@ -796,10 +776,12 @@ func (p *AlibabaCloudProvider) getPrivateZones() (map[string]*alibabaPrivateZone
 					continue
 				}
 
+				// Use the same format as ExternalDNS
+				record.Value = wrapWithQuotes(recordType, record.Value)
 				// TODO filter Locked
 				records = append(records, record)
 			}
-			nextPage := getNextPageNumber(int64(response.PageNumber), defaultAlibabaCloudPageSize, int64(response.TotalItems))
+			nextPage := getNextPageNumber(int64(response.PageNumber), int64(response.TotalItems))
 			if nextPage == 0 {
 				break
 			} else {
@@ -852,11 +834,7 @@ func (p *AlibabaCloudProvider) privateZoneRecords() ([]*endpoint.Endpoint, error
 			}
 			var targets []string
 			for _, record := range recordList {
-				target := record.Value
-				if recordType == "TXT" {
-					target = p.unescapeTXTRecordValue(target)
-				}
-				targets = append(targets, target)
+				targets = append(targets, record.Value)
 			}
 			ep := endpoint.NewEndpointWithTTL(name, recordType, endpoint.TTL(ttl), targets...)
 			endpoints = append(endpoints, ep)
@@ -886,10 +864,6 @@ func (p *AlibabaCloudProvider) createPrivateZoneRecord(zones map[string]*alibaba
 		request.Ttl = requests.NewInteger(ttl)
 	}
 
-	if endpoint.RecordType == "TXT" {
-		target = p.escapeTXTRecordValue(target)
-	}
-
 	request.Value = target
 
 	if p.dryRun {
@@ -906,13 +880,12 @@ func (p *AlibabaCloudProvider) createPrivateZoneRecord(zones map[string]*alibaba
 	return err
 }
 
-func (p *AlibabaCloudProvider) createPrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) error {
+func (p *AlibabaCloudProvider) createPrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) {
 	for _, endpoint := range endpoints {
 		for _, target := range endpoint.Targets {
 			_ = p.createPrivateZoneRecord(zones, endpoint, target)
 		}
 	}
-	return nil
 }
 
 func (p *AlibabaCloudProvider) deletePrivateZoneRecord(recordID int64) error {
@@ -934,25 +907,20 @@ func (p *AlibabaCloudProvider) deletePrivateZoneRecord(recordID int64) error {
 	return err
 }
 
-func (p *AlibabaCloudProvider) deletePrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) error {
+func (p *AlibabaCloudProvider) deletePrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) {
 	zoneNames := keys(zones)
 	for _, endpoint := range endpoints {
 		rr, domain := p.splitDNSName(endpoint.DNSName, zoneNames)
 
 		zone := zones[domain]
 		if zone == nil {
-			err := fmt.Errorf("failed to find private zone '%s'", domain)
-			log.Errorf("Failed to delete %s record named '%s' for Alibaba Cloud Private Zone: %v", endpoint.RecordType, endpoint.DNSName, err)
+			log.Errorf("Failed to delete %s record named '%s' for Alibaba Cloud Private Zone: failed to find private zone '%s'", endpoint.RecordType, endpoint.DNSName, domain)
 			continue
 		}
 		found := false
 		for _, record := range zone.records {
 			if rr == record.Rr && endpoint.RecordType == record.Type {
-				value := record.Value
-				if record.Type == "TXT" {
-					value = p.unescapeTXTRecordValue(value)
-				}
-				if slices.Contains(endpoint.Targets, value) {
+				if slices.Contains(endpoint.Targets, record.Value) {
 					p.deletePrivateZoneRecord(record.RecordId)
 					found = true
 				}
@@ -962,7 +930,6 @@ func (p *AlibabaCloudProvider) deletePrivateZoneRecords(zones map[string]*alibab
 			log.Errorf("Failed to find %s record named '%s' to delete for Alibaba Cloud Private Zone", endpoint.RecordType, endpoint.DNSName)
 		}
 	}
-	return nil
 }
 
 // ApplyChanges applies the given changes.
@@ -1021,14 +988,13 @@ func (p *AlibabaCloudProvider) equalsPrivateZone(record pvtz.Record, endpoint *e
 	return ttl1 == ttl2
 }
 
-func (p *AlibabaCloudProvider) updatePrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) error {
+func (p *AlibabaCloudProvider) updatePrivateZoneRecords(zones map[string]*alibabaPrivateZone, endpoints []*endpoint.Endpoint) {
 	zoneNames := keys(zones)
 	for _, endpoint := range endpoints {
 		rr, domain := p.splitDNSName(endpoint.DNSName, zoneNames)
 		zone := zones[domain]
 		if zone == nil {
-			err := fmt.Errorf("failed to find private zone '%s'", domain)
-			log.Errorf("Failed to update %s record named '%s' for Alibaba Cloud Private Zone: %v", endpoint.RecordType, endpoint.DNSName, err)
+			log.Errorf("Failed to update %s record named '%s' for Alibaba Cloud Private Zone: failed to find private zone '%s'", endpoint.RecordType, endpoint.DNSName, domain)
 			continue
 		}
 
@@ -1036,11 +1002,7 @@ func (p *AlibabaCloudProvider) updatePrivateZoneRecords(zones map[string]*alibab
 			if record.Rr != rr || record.Type != endpoint.RecordType {
 				continue
 			}
-			value := record.Value
-			if record.Type == "TXT" {
-				value = p.unescapeTXTRecordValue(value)
-			}
-			found := slices.Contains(endpoint.Targets, value)
+			found := slices.Contains(endpoint.Targets, record.Value)
 			if found {
 				if !p.equalsPrivateZone(record, endpoint) {
 					// Update record
@@ -1051,26 +1013,14 @@ func (p *AlibabaCloudProvider) updatePrivateZoneRecords(zones map[string]*alibab
 			}
 		}
 		for _, target := range endpoint.Targets {
-			if endpoint.RecordType == "TXT" {
-				target = p.escapeTXTRecordValue(target)
-			}
-			found := false
-			for _, record := range zone.records {
-				if record.Rr != rr || record.Type != endpoint.RecordType {
-					continue
-				}
-				// Find matched record to delete
-				if record.Value == target {
-					found = true
-					break
-				}
-			}
+			found := slices.ContainsFunc(zone.records, func(record pvtz.Record) bool {
+				return record.Rr == rr && record.Type == endpoint.RecordType && record.Value == target
+			})
 			if !found {
 				p.createPrivateZoneRecord(zones, endpoint, target)
 			}
 		}
 	}
-	return nil
 }
 
 func keys[T any](value map[string]T) []string {

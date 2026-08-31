@@ -1,10 +1,10 @@
 # Configure DNS record TTL (Time-To-Live)
 
-> To customize DNS record TTL (Time-To-Live) in a DNS record`, you can use the `external-dns.alpha.kubernetes.io/ttl: <duration>` annotation or flag `--min-ttl=<duration>`. TTL is specified as an integer encoded as string representing seconds. Example; `1s`, `1m2s`, `1h2m11s`
+> To customize DNS record TTL (Time-To-Live) in a DNS record`, you can use the `external-dns.kubernetes.io/ttl: <duration>` annotation or flag `--min-ttl=<duration>`. TTL is specified as an integer encoded as string representing seconds. Example; `1s`, `1m2s`, `1h2m11s`
 
 Behaviour:
 
-- If the `external-dns.alpha.kubernetes.io/ttl` annotation is set, it overrides the default TTL(0) value.
+- If the `external-dns.kubernetes.io/ttl` annotation is set, it overrides the default TTL(0) value.
 - If the annotation is not set, the default TTL value is used, unless the `--min-ttl` flag is provided.
 - If the annotation is set to `0`, and the `--min-ttl=1s` flag is provided, the value from `--min-ttl` will be used instead.
 - Not all providers support the custom TTL value, and some may override it with their own default values.
@@ -16,8 +16,8 @@ apiVersion: v1
 kind: Service
 metadata:
   annotations:
-    external-dns.alpha.kubernetes.io/hostname: nginx.external-dns-test.my-org.com.
-    external-dns.alpha.kubernetes.io/ttl: "60"
+    external-dns.kubernetes.io/hostname: nginx.external-dns-test.my-org.com.
+    external-dns.kubernetes.io/ttl: "60"
   ...
 ```
 
@@ -28,8 +28,8 @@ apiVersion: v1
 kind: Service
 metadata:
   annotations:
-    external-dns.alpha.kubernetes.io/hostname: nginx.external-dns-test.my-org.com.
-    external-dns.alpha.kubernetes.io/ttl: "1m"
+    external-dns.kubernetes.io/hostname: nginx.external-dns-test.my-org.com.
+    external-dns.kubernetes.io/ttl: "1m"
   ...
 ```
 
@@ -39,71 +39,67 @@ TTL must be a positive value.
 
 ## TTL annotation support
 
-> Note: For TTL annotations to work, the `external-dns.alpha.kubernetes.io/hostname` annotation must be set on the resource and be supported by the provider as well as the source.
+> Note: For TTL annotations to work, the `external-dns.kubernetes.io/hostname` annotation must be set on the resource and be supported by the provider as well as the source.
 
 ### Providers
 
 | Provider       | Supported |
 |:---------------|:---------:|
-| `Akamai`       |     ✅     |
-| `AlibabaCloud` |     ✅     |
-| `AWS`          |     ✅     |
-| `AWSSD`        |     ✅     |
-| `Azure`        |     ✅     |
-| `Civo`         |     ❌     |
-| `Cloudflare`   |     ✅     |
-| `CoreDNS`      |     ❌     |
-| `DigitalOcean` |     ✅     |
-| `DNSSimple`    |     ✅     |
-| `Exoscale`     |     ✅     |
-| `Gandi`        |     ✅     |
-| `GoDaddy`      |     ✅     |
-| `Google GCP`   |     ✅     |
-| `InMemory`     |     ❌     |
-| `Linode`       |     ❌     |
-| `NS1`          |     ❌     |
-| `OCI`          |     ✅     |
-| `OVH`          |     ❌     |
-| `PDNS`         |     ❌     |
-| `PiHole`       |     ✅     |
-| `Plural`       |     ❌     |
-| `RFC2136`      |     ✅     |
-| `Scaleway`     |     ✅     |
-| `Transip`      |     ✅     |
-| `Webhook`      |     ✅     |
+| `AlibabaCloud` |    Yes    |
+| `AWS`          |    Yes    |
+| `AWSSD`        |    Yes    |
+| `Azure`        |    Yes    |
+| `Civo`         |    No     |
+| `Cloudflare`   |    Yes    |
+| `CoreDNS`      |    No     |
+| `DNSSimple`    |    Yes    |
+| `Exoscale`     |    Yes    |
+| `Gandi`        |    Yes    |
+| `GoDaddy`      |    Yes    |
+| `Google GCP`   |    Yes    |
+| `InMemory`     |    No     |
+| `Linode`       |    No     |
+| `NS1`          |    No     |
+| `OCI`          |    Yes    |
+| `OVH`          |    No     |
+| `PDNS`         |    No     |
+| `PiHole`       |    Yes    |
+| `RFC2136`      |    Yes    |
+| `Scaleway`     |    Yes    |
+| `Webhook`      |    Yes    |
 
 ### Sources
 
 | Source                 | Supported |
 |:-----------------------|:---------:|
-| `ambassador-host`      |     ✅     |
-| `connector`            |     ❌     |
-| `contour-httpproxy`    |     ✅     |
-| `crd`                  |     ❌     |
-| `empty`                |     ❌     |
-| `f5-transportserver`   |     ✅     |
-| `f5-virtualserver`     |     ✅     |
-| `fake`                 |     ❌     |
-| `gateway-grpcroute`    |     ✅     |
-| `gateway-httproute`    |     ✅     |
-| `gateway-tcproute`     |     ✅     |
-| `gateway-tlsroute`     |     ✅     |
-| `gateway-udproute`     |     ✅     |
-| `gloo-proxy`           |     ✅     |
-| `ingress`              |     ✅     |
-| `istio-gateway`        |     ✅     |
-| `istio-virtualservice` |     ✅     |
-| `kong-tcpingress`      |     ✅     |
-| `node`                 |     ✅     |
-| `openshift-route`      |     ✅     |
-| `pod`                  |     ✅     |
-| `service`              |     ✅     |
-| `skipper-routegroup`   |     ✅     |
-| `traefik-proxy`        |     ✅     |
+| `ambassador-host`      |    Yes    |
+| `connector`            |    No     |
+| `contour-httpproxy`    |    Yes    |
+| `crd`                  |    No     |
+| `empty`                |    No     |
+| `f5-transportserver`   |    Yes    |
+| `f5-virtualserver`     |    Yes    |
+| `fake`                 |    No     |
+| `gateway-grpcroute`    |    Yes    |
+| `gateway-httproute`    |    Yes    |
+| `gateway-tcproute`     |    Yes    |
+| `gateway-tlsroute`     |    Yes    |
+| `gateway-udproute`     |    Yes    |
+| `gloo-proxy`           |    Yes    |
+| `ingress`              |    Yes    |
+| `istio-gateway`        |    Yes    |
+| `istio-virtualservice` |    Yes    |
+| `kong-tcpingress`      |    Yes    |
+| `node`                 |    Yes    |
+| `openshift-route`      |    Yes    |
+| `pod`                  |    Yes    |
+| `service`              |    Yes    |
+| `skipper-routegroup`   |    Yes    |
+| `traefik-proxy`        |    Yes    |
 
 ## Notes
 
-When the `external-dns.alpha.kubernetes.io/ttl` annotation is not provided, the TTL will default to 0 seconds and `endpoint.TTL.isConfigured()` will be false.
+When the `external-dns.kubernetes.io/ttl` annotation is not provided, the TTL will default to 0 seconds and `endpoint.TTL.isConfigured()` will be false.
 
 ### AWS Provider
 
@@ -119,11 +115,6 @@ By default it will be 300s.
 
 CloudFlare overrides the value to "auto" when the TTL is 0.
 
-### DigitalOcean Provider
-
-The DigitalOcean Provider overrides the value to 300s when the TTL is 0.
-This value is a constant in the provider code.
-
 ### DNSimple Provider
 
 The DNSimple Provider default TTL is used when the TTL is 0. The default TTL is 3600s.
@@ -134,22 +125,18 @@ Previously with the Google Provider, TTL's were hard-coded to 300s.
 For safety, the Google Provider overrides the value to 300s when the TTL is 0.
 This value is a constant in the provider code.
 
-For the moment, it is impossible to use a TTL value of 0 with the AWS, DigitalOcean, or Google Providers.
+For the moment, it is impossible to use a TTL value of 0 with the AWS or Google Providers.
 This behavior may change in the future.
 
 ### Linode Provider
 
 The Linode Provider default TTL is used when the TTL is 0. The default is 24 hours
 
-### TransIP Provider
+## Use Cases for `external-dns.kubernetes.io/ttl` annotation and `--min-ttl` flag`
 
-The TransIP Provider minimal TTL is used when the TTL is 0. The minimal TTL is 60s.
+The `external-dns.kubernetes.io/ttl` annotation allows you to set a custom **TTL (Time To Live)** for DNS records managed by `external-dns`.
 
-## Use Cases for `external-dns.alpha.kubernetes.io/ttl` annotation and `--min-ttl` flag`
-
-The `external-dns.alpha.kubernetes.io/ttl` annotation allows you to set a custom **TTL (Time To Live)** for DNS records managed by `external-dns`.
-
-Use the `external-dns.alpha.kubernetes.io/tt` annotation to fine-tune DNS caching behavior per record, balancing between update frequency and performance.
+Use the `external-dns.kubernetes.io/tt` annotation to fine-tune DNS caching behavior per record, balancing between update frequency and performance.
 
 This is useful in several real-world scenarios depending on how frequently DNS records are expected to change.
 
@@ -165,7 +152,7 @@ For services that must be highly available—like APIs, databases, or external l
 
 ```yaml
 annotations:
-  external-dns.alpha.kubernetes.io/ttl: "30s"
+  external-dns.kubernetes.io/ttl: "30s"
 ```
 
 ---
@@ -180,7 +167,7 @@ If your service’s IP or endpoint rarely changes (e.g., static websites, intern
 
 ```yml
 annotations:
-  external-dns.alpha.kubernetes.io/ttl: "24h"
+  external-dns.kubernetes.io/ttl: "24h"
 ```
 
 ---

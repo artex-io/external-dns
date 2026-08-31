@@ -24,13 +24,14 @@ import (
 	"time"
 
 	azcoreruntime "github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	privatedns "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
 	log "github.com/sirupsen/logrus"
 
+	"sigs.k8s.io/external-dns/internal/sets"
 	"sigs.k8s.io/external-dns/provider/blueprint"
 
 	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/pkg/apis/externaldns"
 	"sigs.k8s.io/external-dns/plan"
 	"sigs.k8s.io/external-dns/provider"
 )
@@ -63,10 +64,10 @@ type AzurePrivateDNSProvider struct {
 	maxRetriesCount              int
 }
 
-// NewAzurePrivateDNSProvider creates a new Azure Private DNS provider.
+// newPrivateDNSProvider creates a new Azure Private DNS provider.
 //
 // Returns the provider or an error if a provider could not be created.
-func NewAzurePrivateDNSProvider(configFile string, domainFilter *endpoint.DomainFilter, zoneNameFilter *endpoint.DomainFilter, zoneIDFilter provider.ZoneIDFilter, subscriptionID string, resourceGroup string, userAssignedIdentityClientID string, activeDirectoryAuthorityHost string, zonesCacheDuration time.Duration, maxRetriesCount int, dryRun bool) (*AzurePrivateDNSProvider, error) {
+func newPrivateDNSProvider(configFile string, domainFilter, zoneNameFilter *endpoint.DomainFilter, zoneIDFilter provider.ZoneIDFilter, subscriptionID, resourceGroup, userAssignedIdentityClientID, activeDirectoryAuthorityHost string, zonesCacheDuration time.Duration, maxRetriesCount int, dryRun bool) (*AzurePrivateDNSProvider, error) {
 	cfg, err := getConfig(configFile, subscriptionID, resourceGroup, userAssignedIdentityClientID, activeDirectoryAuthorityHost)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Azure config file '%s': %w", configFile, err)
@@ -98,6 +99,23 @@ func NewAzurePrivateDNSProvider(configFile string, domainFilter *endpoint.Domain
 		recordSetsClient:             recordSetsClient,
 		maxRetriesCount:              maxRetriesCount,
 	}, nil
+}
+
+// NewPrivate creates an Azure Private DNS provider from the given configuration.
+func NewPrivate(_ context.Context, cfg *externaldns.Config, domainFilter *endpoint.DomainFilter) (provider.Provider, error) {
+	return newPrivateDNSProvider(
+		cfg.AzureConfigFile,
+		domainFilter,
+		endpoint.NewDomainFilter(cfg.ZoneNameFilter),
+		provider.NewZoneIDFilter(cfg.ZoneIDFilter),
+		cfg.AzureSubscriptionID,
+		cfg.AzureResourceGroup,
+		cfg.AzureUserAssignedIdentityClientID,
+		cfg.AzureActiveDirectoryAuthorityHost,
+		cfg.AzureZonesCacheDuration,
+		cfg.AzureMaxRetriesCount,
+		cfg.DryRun,
+	)
 }
 
 // Records gets the current records.
@@ -216,7 +234,7 @@ func (p *AzurePrivateDNSProvider) zones(ctx context.Context) ([]privatedns.Priva
 type azurePrivateDNSChangeMap map[string][]*endpoint.Endpoint
 
 func (p *AzurePrivateDNSProvider) mapChanges(zones []privatedns.PrivateZone, changes *plan.Changes) (azurePrivateDNSChangeMap, azurePrivateDNSChangeMap) {
-	ignored := map[string]bool{}
+	ignored := sets.New[string]()
 	deleted := azurePrivateDNSChangeMap{}
 	updated := azurePrivateDNSChangeMap{}
 	zoneNameIDMapper := provider.ZoneIDName{}
@@ -228,8 +246,8 @@ func (p *AzurePrivateDNSProvider) mapChanges(zones []privatedns.PrivateZone, cha
 	mapChange := func(changeMap azurePrivateDNSChangeMap, change *endpoint.Endpoint) {
 		zone, _ := zoneNameIDMapper.FindZone(change.DNSName)
 		if zone == "" {
-			if _, ok := ignored[change.DNSName]; !ok {
-				ignored[change.DNSName] = true
+			if !ignored.Has(change.DNSName) {
+				ignored.Insert(change.DNSName)
 				log.Infof("Ignoring changes to '%s' because a suitable Azure Private DNS zone was not found.", change.DNSName)
 			}
 			return
@@ -357,12 +375,12 @@ func (p *AzurePrivateDNSProvider) newRecordSet(endpoint *endpoint.Endpoint) (pri
 		aRecords := make([]*privatedns.ARecord, len(endpoint.Targets))
 		for i, target := range endpoint.Targets {
 			aRecords[i] = &privatedns.ARecord{
-				IPv4Address: to.Ptr(target),
+				IPv4Address: new(target),
 			}
 		}
 		return privatedns.RecordSet{
 			Properties: &privatedns.RecordSetProperties{
-				TTL:      to.Ptr(ttl),
+				TTL:      new(ttl),
 				ARecords: aRecords,
 			},
 		}, nil
@@ -370,21 +388,21 @@ func (p *AzurePrivateDNSProvider) newRecordSet(endpoint *endpoint.Endpoint) (pri
 		aaaaRecords := make([]*privatedns.AaaaRecord, len(endpoint.Targets))
 		for i, target := range endpoint.Targets {
 			aaaaRecords[i] = &privatedns.AaaaRecord{
-				IPv6Address: to.Ptr(target),
+				IPv6Address: new(target),
 			}
 		}
 		return privatedns.RecordSet{
 			Properties: &privatedns.RecordSetProperties{
-				TTL:         to.Ptr(ttl),
+				TTL:         new(ttl),
 				AaaaRecords: aaaaRecords,
 			},
 		}, nil
 	case privatedns.RecordTypeCNAME:
 		return privatedns.RecordSet{
 			Properties: &privatedns.RecordSetProperties{
-				TTL: to.Ptr(ttl),
+				TTL: new(ttl),
 				CnameRecord: &privatedns.CnameRecord{
-					Cname: to.Ptr(endpoint.Targets[0]),
+					Cname: new(endpoint.Targets[0]),
 				},
 			},
 		}, nil
@@ -399,14 +417,14 @@ func (p *AzurePrivateDNSProvider) newRecordSet(endpoint *endpoint.Endpoint) (pri
 		}
 		return privatedns.RecordSet{
 			Properties: &privatedns.RecordSetProperties{
-				TTL:       to.Ptr(ttl),
+				TTL:       new(ttl),
 				MxRecords: mxRecords,
 			},
 		}, nil
 	case privatedns.RecordTypeTXT:
 		return privatedns.RecordSet{
 			Properties: &privatedns.RecordSetProperties{
-				TTL: to.Ptr(ttl),
+				TTL: new(ttl),
 				TxtRecords: []*privatedns.TxtRecord{
 					{
 						Value: []*string{
